@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum CliObfuscationLevel {
     Minimal,
     Low,
@@ -25,22 +25,19 @@ impl From<CliObfuscationLevel> for rbxl_obfuscate::ObfuscationLevel {
 #[command(
     author,
     version,
-    about = "Obfuscate Roblox RBXL script sources with Prometheus"
+    about = "Obfuscate Roblox RBXL/RBXM script sources with Prometheus"
 )]
 struct Cli {
-    /// Input .rbxl file.
+    /// Input .rbxl or .rbxm file.
     input: PathBuf,
 
-    /// Output .rbxl file. Must not be the same path as input.
-    output: PathBuf,
+    /// Output file. Defaults to <input-stem>-obfuscated_<Level>.<extension>.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 
-    /// Deprecated compatibility flag; Prometheus uses --level presets and ignores custom configs.
-    #[arg(long)]
-    darklua_config: Option<PathBuf>,
-
-    /// Built-in obfuscation level to map to a Prometheus preset. Defaults to minimal.
+    /// Built-in obfuscation level to map to a Prometheus preset.
     #[arg(long, value_enum)]
-    level: Option<CliObfuscationLevel>,
+    level: CliObfuscationLevel,
 
     /// Report what would be processed without running Prometheus or writing output.
     #[arg(long)]
@@ -62,21 +59,48 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    if cli.darklua_config.is_some() && cli.level.is_some() {
-        anyhow::bail!("--level cannot be combined with --darklua-config");
-    }
-
-    if cli.darklua_config.is_some() {
-        eprintln!("Ignoring --darklua-config; the Prometheus backend uses --level presets.");
-    }
-
     rbxl_obfuscate::run(rbxl_obfuscate::Options {
         input: cli.input,
         output: cli.output,
-        obfuscation_level: cli.level.map(Into::into).unwrap_or_default(),
+        obfuscation_level: cli.level.into(),
         dry_run: cli.dry_run,
         backup_dir: cli.backup_dir,
         skip_paths: cli.skip_path,
         manifest: cli.manifest,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_is_required() {
+        assert!(Cli::try_parse_from(["rbxl-obfuscate", "input.rbxl"]).is_err());
+    }
+
+    #[test]
+    fn output_is_optional() {
+        let cli =
+            Cli::try_parse_from(["rbxl-obfuscate", "input.rbxm", "--level", "medium"]).unwrap();
+
+        assert_eq!(cli.input, PathBuf::from("input.rbxm"));
+        assert_eq!(cli.level, CliObfuscationLevel::Medium);
+        assert_eq!(cli.output, None);
+    }
+
+    #[test]
+    fn output_flag_is_supported() {
+        let cli = Cli::try_parse_from([
+            "rbxl-obfuscate",
+            "input.rbxl",
+            "--level",
+            "high",
+            "--output",
+            "output.rbxl",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.output, Some(PathBuf::from("output.rbxl")));
+    }
 }
