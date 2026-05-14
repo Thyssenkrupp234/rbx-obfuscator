@@ -1,10 +1,13 @@
 use std::{
     collections::HashSet,
+    env,
     ffi::OsString,
     fs::{self, File},
+    io::ErrorKind,
     io::{BufReader, BufWriter},
     path::{Component, Path, PathBuf},
     process::{Command, Output},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,13 +19,13 @@ use serde::Serialize;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
 const SCRIPT_CLASSES: &[&str] = &["Script", "LocalScript", "ModuleScript"];
-const PROMETHEUS_ENV_VAR: &str = "RBXL_OBFUSCATE_PROMETHEUS";
+const PROMETHEUS_COMMAND: &str = "prometheus-lua";
 const PROMETHEUS_INSTALL_URL: &str =
     "https://raw.githubusercontent.com/prometheus-lua/Prometheus/master/install.sh";
-const PROMETHEUS_TOOL_DIR: &str = ".tools/prometheus-lua";
-const PROMETHEUS_HOME_DIR: &str = "home";
-const PROMETHEUS_BIN_DIR: &str = "bin";
-const PROMETHEUS_BIN_NAME: &str = "prometheus-lua";
+const PROMETHEUS_INSTALL_COMMAND: &str =
+    "curl -fsSL https://raw.githubusercontent.com/prometheus-lua/Prometheus/master/install.sh | sh";
+const PROMETHEUS_UPDATE_STATE_FILE: &str = "prometheus-last-update";
+const PROMETHEUS_UPDATE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +46,47 @@ impl ObfuscationLevel {
             Self::High => "high",
         }
     }
+
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Minimal => "Minimal",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RobloxFileFormat {
+    Rbxl,
+    Rbxm,
+}
+
+impl RobloxFileFormat {
+    fn from_path(path: &Path) -> Result<Self> {
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("rbxl") => Ok(Self::Rbxl),
+            Some("rbxm") => Ok(Self::Rbxm),
+            _ => bail!(
+                "unsupported input file extension for {}: expected .rbxl or .rbxm",
+                path.display()
+            ),
+        }
+    }
+
+    fn as_name(self) -> &'static str {
+        match self {
+            Self::Rbxl => "RBXL",
+            Self::Rbxm => "RBXM",
+        }
+    }
 }
 
 pub fn prometheus_preset_for_level(level: ObfuscationLevel) -> &'static str {
@@ -57,7 +101,7 @@ pub fn prometheus_preset_for_level(level: ObfuscationLevel) -> &'static str {
 #[derive(Debug)]
 pub struct Options {
     pub input: PathBuf,
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
     pub obfuscation_level: ObfuscationLevel,
     pub dry_run: bool,
     pub backup_dir: Option<PathBuf>,
@@ -76,7 +120,8 @@ struct ScriptCandidate {
 #[derive(Debug, Serialize)]
 struct Manifest {
     input: PathBuf,
-    output: Option<PathBuf>,
+    input_format: RobloxFileFormat,
+    output: PathBuf,
     dry_run: bool,
     backend: &'static str,
     prometheus_executable: PathBuf,
@@ -114,9 +159,13 @@ struct FailedScript {
 }
 
 pub fn run(options: Options) -> Result<()> {
-    validate_options(&options)?;
-    let project_root = project_root_for_tools();
-    let prometheus_path = resolve_or_install_prometheus(&project_root, options.dry_run)?;
+    let input_format = validate_input_format(&options.input)?;
+    let output = match &options.output {
+        Some(output) => output.clone(),
+        None => default_output_path(&options.input, options.obfuscation_level)?,
+    };
+    validate_options(&options, &output)?;
+    let prometheus_path = resolve_or_install_prometheus(options.dry_run)?;
     let prometheus_preset = prometheus_preset_for_level(options.obfuscation_level);
 
     if options.dry_run {
@@ -132,13 +181,21 @@ pub fn run(options: Options) -> Result<()> {
         );
     }
 
-    eprintln!("Loading RBXL: {}", options.input.display());
+    eprintln!(
+        "Loading {}: {}",
+        input_format.as_name(),
+        options.input.display()
+    );
     let input = BufReader::new(
         File::open(&options.input)
-            .with_context(|| format!("failed to open input RBXL {}", options.input.display()))?,
+            .with_context(|| format!("failed to open input file {}", options.input.display()))?,
     );
-    let mut dom = rbx_binary::from_reader(input)
-        .with_context(|| format!("failed to read RBXL {}", options.input.display()))?;
+    let mut dom = rbx_binary::from_reader(input).with_context(|| {
+        format!(
+            "failed to read Roblox binary file {}",
+            options.input.display()
+        )
+    })?;
 
     let skip_paths: HashSet<String> = options.skip_paths.iter().cloned().collect();
     let scripts = collect_scripts(&dom)?;
@@ -151,7 +208,7 @@ pub fn run(options: Options) -> Result<()> {
     let prometheus_temp_dir = if options.dry_run {
         None
     } else {
-        Some(create_prometheus_temp_dir(&project_root)?)
+        Some(create_prometheus_temp_dir()?)
     };
 
     if let Some(backup_dir) = &options.backup_dir {
@@ -264,11 +321,8 @@ pub fn run(options: Options) -> Result<()> {
     if let Some(manifest_path) = &options.manifest {
         let manifest = Manifest {
             input: options.input.clone(),
-            output: if options.dry_run {
-                None
-            } else {
-                Some(options.output.clone())
-            },
+            input_format,
+            output: output.clone(),
             dry_run: options.dry_run,
             backend: "prometheus",
             prometheus_executable: prometheus_path.clone(),
@@ -296,222 +350,269 @@ pub fn run(options: Options) -> Result<()> {
     }
 
     if options.dry_run {
-        eprintln!("Dry run complete; no RBXL output written");
+        eprintln!("Dry run complete; no Roblox binary output written");
         return Ok(());
     }
 
-    write_rbxl(&options.output, &dom)?;
+    write_roblox_binary(&output, &dom, input_format)?;
 
     eprintln!("Done");
     Ok(())
 }
 
-fn validate_options(options: &Options) -> Result<()> {
+fn validate_input_format(input: &Path) -> Result<RobloxFileFormat> {
+    RobloxFileFormat::from_path(input)
+}
+
+fn validate_options(options: &Options, output: &Path) -> Result<()> {
     if !options.input.exists() {
         bail!("input file does not exist: {}", options.input.display());
     }
     if !options.input.is_file() {
         bail!("input path is not a file: {}", options.input.display());
     }
-    if same_path(&options.input, &options.output)? {
-        bail!(
-            "output must not overwrite input: {}",
-            options.output.display()
-        );
+    if same_path(&options.input, output)? {
+        bail!("output must not overwrite input: {}", output.display());
     }
     Ok(())
 }
 
-fn project_root_for_tools() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn default_output_path(input: &Path, level: ObfuscationLevel) -> Result<PathBuf> {
+    let stem = input
+        .file_stem()
+        .ok_or_else(|| anyhow!("input path has no file name: {}", input.display()))?;
+    let extension = input
+        .extension()
+        .ok_or_else(|| anyhow!("input path has no extension: {}", input.display()))?;
+
+    let mut file_name = OsString::from(stem);
+    file_name.push(format!("-obfuscated_{}.", level.as_label()));
+    file_name.push(extension);
+    Ok(input.with_file_name(file_name))
 }
 
-fn resolve_or_install_prometheus(project_root: &Path, dry_run: bool) -> Result<PathBuf> {
-    resolve_or_install_prometheus_with(project_root, dry_run, install_prometheus)
+trait PrometheusRuntime {
+    fn prometheus_available(&mut self) -> Result<bool>;
+    fn install_prometheus(&mut self) -> Result<()>;
+    fn update_prometheus(&mut self) -> Result<()>;
+    fn internet_available(&mut self) -> bool;
+    fn now(&self) -> SystemTime;
 }
 
-fn resolve_or_install_prometheus_with<F>(
-    project_root: &Path,
+struct SystemPrometheusRuntime;
+
+impl PrometheusRuntime for SystemPrometheusRuntime {
+    fn prometheus_available(&mut self) -> Result<bool> {
+        match Command::new(PROMETHEUS_COMMAND).arg("--help").output() {
+            Ok(output) if output.status.success() => Ok(true),
+            Ok(output) => bail!(
+                "{PROMETHEUS_COMMAND} --help exited with status {}. {}",
+                output.status,
+                command_output_summary(&output)
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to launch {PROMETHEUS_COMMAND} --help"))
+            }
+        }
+    }
+
+    fn install_prometheus(&mut self) -> Result<()> {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(PROMETHEUS_INSTALL_COMMAND)
+            .output()
+            .context("failed to launch Prometheus installer with sh")?;
+
+        if !output.status.success() {
+            bail!(
+                "Prometheus installer exited with status {}. {}",
+                output.status,
+                command_output_summary(&output)
+            );
+        }
+
+        Ok(())
+    }
+
+    fn update_prometheus(&mut self) -> Result<()> {
+        let output = Command::new(PROMETHEUS_COMMAND)
+            .arg("update")
+            .output()
+            .with_context(|| format!("failed to launch {PROMETHEUS_COMMAND} update"))?;
+
+        if !output.status.success() {
+            bail!(
+                "{PROMETHEUS_COMMAND} update exited with status {}. {}",
+                output.status,
+                command_output_summary(&output)
+            );
+        }
+
+        Ok(())
+    }
+
+    fn internet_available(&mut self) -> bool {
+        Command::new("curl")
+            .args(["-fsI", "--max-time", "5", PROMETHEUS_INSTALL_URL])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+fn resolve_or_install_prometheus(dry_run: bool) -> Result<PathBuf> {
+    let state_file = prometheus_update_state_file();
+    let mut runtime = SystemPrometheusRuntime;
+    resolve_or_install_prometheus_with(dry_run, state_file.as_deref(), &mut runtime)
+}
+
+fn resolve_or_install_prometheus_with(
     dry_run: bool,
-    installer: F,
-) -> Result<PathBuf>
-where
-    F: FnOnce(&Path) -> Result<PathBuf>,
-{
-    if let Some(path) = std::env::var_os(PROMETHEUS_ENV_VAR) {
-        let path = PathBuf::from(path);
-        if path.as_os_str().is_empty() {
-            bail!("{PROMETHEUS_ENV_VAR} is set but empty");
-        }
-        if !dry_run {
-            ensure_prometheus_executable(&path).with_context(|| {
-                format!(
-                    "{PROMETHEUS_ENV_VAR} points to an unusable Prometheus executable: {}",
-                    path.display()
-                )
-            })?;
-        }
-        return Ok(path);
-    }
-
-    let local_path = project_local_prometheus_path(project_root);
+    state_file: Option<&Path>,
+    runtime: &mut impl PrometheusRuntime,
+) -> Result<PathBuf> {
+    let prometheus_path = PathBuf::from(PROMETHEUS_COMMAND);
     if dry_run {
-        return Ok(local_path);
+        return Ok(prometheus_path);
     }
 
-    if local_path.exists() {
-        ensure_prometheus_executable(&local_path).with_context(|| {
+    if !runtime.prometheus_available()? {
+        eprintln!("{PROMETHEUS_COMMAND} not found on PATH; installing Prometheus");
+        runtime.install_prometheus().with_context(|| {
             format!(
-                "repo-local Prometheus executable is not usable: {}",
-                local_path.display()
-            )
-        })?;
-        return Ok(local_path);
-    }
-
-    installer(project_root).with_context(|| {
-        format!(
-            "failed to install Prometheus locally under {}. Install curl or wget and rerun, or set {PROMETHEUS_ENV_VAR} to an existing prometheus-lua executable",
-            prometheus_tool_dir(project_root).display()
-        )
-    })?;
-
-    ensure_prometheus_executable(&local_path).with_context(|| {
-        format!(
-            "Prometheus was installed but the expected executable is not usable: {}",
-            local_path.display()
-        )
-    })?;
-    Ok(local_path)
-}
-
-fn project_local_prometheus_path(project_root: &Path) -> PathBuf {
-    prometheus_tool_dir(project_root)
-        .join(PROMETHEUS_BIN_DIR)
-        .join(PROMETHEUS_BIN_NAME)
-}
-
-fn prometheus_tool_dir(project_root: &Path) -> PathBuf {
-    project_root.join(PROMETHEUS_TOOL_DIR)
-}
-
-fn install_prometheus(project_root: &Path) -> Result<PathBuf> {
-    let tool_dir = prometheus_tool_dir(project_root);
-    let home_dir = tool_dir.join(PROMETHEUS_HOME_DIR);
-    let bin_dir = tool_dir.join(PROMETHEUS_BIN_DIR);
-
-    fs::create_dir_all(&home_dir)
-        .with_context(|| format!("failed to create Prometheus home {}", home_dir.display()))?;
-    fs::create_dir_all(&bin_dir)
-        .with_context(|| format!("failed to create Prometheus bin {}", bin_dir.display()))?;
-
-    let installer = TempFileBuilder::new()
-        .prefix("install-prometheus-")
-        .suffix(".sh")
-        .tempfile_in(&tool_dir)
-        .with_context(|| {
-            format!(
-                "failed to create temporary Prometheus installer in {}",
-                tool_dir.display()
+                "failed to install Prometheus with `{PROMETHEUS_INSTALL_COMMAND}`. Install curl and rerun, or install {PROMETHEUS_COMMAND} on PATH"
             )
         })?;
 
-    download_prometheus_installer(installer.path())?;
+        if !runtime.prometheus_available()? {
+            bail!("Prometheus installed, but {PROMETHEUS_COMMAND} is still not usable on PATH");
+        }
 
-    let output = Command::new("sh")
-        .arg(installer.path())
-        .env("PROMETHEUS_LUA_HOME", &home_dir)
-        .env("PROMETHEUS_LUA_BIN", &bin_dir)
-        .current_dir(project_root)
-        .output()
-        .context("failed to launch Prometheus installer with sh")?;
+        write_prometheus_update_timestamp(state_file, runtime.now())?;
+        return Ok(prometheus_path);
+    }
 
-    if !output.status.success() {
-        bail!(
-            "Prometheus installer exited with status {}. {}",
-            output.status,
-            command_output_summary(&output)
+    maybe_update_prometheus(state_file, runtime)?;
+    Ok(prometheus_path)
+}
+
+fn maybe_update_prometheus(
+    state_file: Option<&Path>,
+    runtime: &mut impl PrometheusRuntime,
+) -> Result<()> {
+    if !prometheus_update_is_stale(state_file, runtime.now())? {
+        return Ok(());
+    }
+
+    if !runtime.internet_available() {
+        eprintln!("Prometheus update check skipped; no internet connection detected");
+        return Ok(());
+    }
+
+    eprintln!("Updating Prometheus installation");
+    if let Err(update_error) = runtime.update_prometheus() {
+        eprintln!(
+            "{PROMETHEUS_COMMAND} update failed; retrying with installer: {}",
+            first_error_line(&format!("{update_error:#}"))
+        );
+        runtime.install_prometheus().with_context(|| {
+            format!(
+                "failed to update Prometheus with `{PROMETHEUS_COMMAND} update` or `{PROMETHEUS_INSTALL_COMMAND}`"
+            )
+        })?;
+    }
+
+    if !runtime.prometheus_available()? {
+        bail!("Prometheus updated, but {PROMETHEUS_COMMAND} is not usable on PATH");
+    }
+
+    write_prometheus_update_timestamp(state_file, runtime.now())
+}
+
+fn create_prometheus_temp_dir() -> Result<tempfile::TempDir> {
+    TempFileBuilder::new()
+        .prefix("rbxl-obfuscate-")
+        .tempdir()
+        .context("failed to create temporary Prometheus workspace")
+}
+
+fn prometheus_update_state_file() -> Option<PathBuf> {
+    if let Some(state_home) = env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return Some(
+            PathBuf::from(state_home)
+                .join("rbxl-obfuscate")
+                .join(PROMETHEUS_UPDATE_STATE_FILE),
         );
     }
 
-    Ok(bin_dir.join(PROMETHEUS_BIN_NAME))
-}
-
-fn create_prometheus_temp_dir(project_root: &Path) -> Result<tempfile::TempDir> {
-    let temp_parent = prometheus_tool_dir(project_root).join("tmp");
-    fs::create_dir_all(&temp_parent).with_context(|| {
-        format!(
-            "failed to create Prometheus temporary directory {}",
-            temp_parent.display()
-        )
-    })?;
-
-    TempFileBuilder::new()
-        .prefix("rbxl-obfuscate-")
-        .tempdir_in(&temp_parent)
-        .with_context(|| {
-            format!(
-                "failed to create temporary Prometheus workspace in {}",
-                temp_parent.display()
-            )
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("rbxl-obfuscate")
+                .join(PROMETHEUS_UPDATE_STATE_FILE)
         })
 }
 
-fn download_prometheus_installer(destination: &Path) -> Result<()> {
-    let mut failures = Vec::new();
-
-    match Command::new("curl")
-        .arg("-fsSL")
-        .arg(PROMETHEUS_INSTALL_URL)
-        .arg("-o")
-        .arg(destination)
-        .output()
-    {
-        Ok(output) if output.status.success() => return Ok(()),
-        Ok(output) => failures.push(format!(
-            "curl failed with status {}. {}",
-            output.status,
-            command_output_summary(&output)
-        )),
-        Err(error) => failures.push(format!("curl could not be started: {error}")),
-    }
-
-    match Command::new("wget")
-        .arg("-q")
-        .arg("-O")
-        .arg(destination)
-        .arg(PROMETHEUS_INSTALL_URL)
-        .output()
-    {
-        Ok(output) if output.status.success() => return Ok(()),
-        Ok(output) => failures.push(format!(
-            "wget failed with status {}. {}",
-            output.status,
-            command_output_summary(&output)
-        )),
-        Err(error) => failures.push(format!("wget could not be started: {error}")),
-    }
-
-    bail!(
-        "could not download Prometheus installer from {PROMETHEUS_INSTALL_URL}. Install curl or wget, then rerun, or set {PROMETHEUS_ENV_VAR} to an existing prometheus-lua executable. Attempts: {}",
-        failures.join("; ")
-    )
+fn prometheus_update_is_stale(state_file: Option<&Path>, now: SystemTime) -> Result<bool> {
+    let Some(state_file) = state_file else {
+        return Ok(true);
+    };
+    let Some(last_update) = read_prometheus_update_timestamp(state_file)? else {
+        return Ok(true);
+    };
+    Ok(now.duration_since(last_update).unwrap_or(Duration::ZERO) >= PROMETHEUS_UPDATE_INTERVAL)
 }
 
-fn ensure_prometheus_executable(path: &Path) -> Result<()> {
-    if !path.exists() {
-        bail!("Prometheus executable does not exist: {}", path.display());
-    }
-    if !path.is_file() {
-        bail!("Prometheus executable is not a file: {}", path.display());
-    }
+fn read_prometheus_update_timestamp(path: &Path) -> Result<Option<SystemTime>> {
+    let timestamp = match fs::read_to_string(path) {
+        Ok(timestamp) => timestamp,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read Prometheus update state {}", path.display())
+            })
+        }
+    };
 
-    Command::new(path)
-        .arg("--help")
-        .output()
-        .with_context(|| format!("failed to launch Prometheus executable {}", path.display()))?;
+    let Ok(seconds) = timestamp.trim().parse::<u64>() else {
+        return Ok(None);
+    };
+    Ok(Some(UNIX_EPOCH + Duration::from_secs(seconds)))
+}
 
-    Ok(())
+fn write_prometheus_update_timestamp(state_file: Option<&Path>, now: SystemTime) -> Result<()> {
+    let Some(state_file) = state_file else {
+        return Ok(());
+    };
+    if let Some(parent) = state_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create Prometheus update state directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let seconds = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    fs::write(state_file, format!("{seconds}\n")).with_context(|| {
+        format!(
+            "failed to write Prometheus update state {}",
+            state_file.display()
+        )
+    })
 }
 
 fn collect_scripts(dom: &WeakDom) -> Result<Vec<ScriptCandidate>> {
@@ -689,8 +790,8 @@ fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
     fs::write(path, json).with_context(|| format!("failed to write manifest {}", path.display()))
 }
 
-fn write_rbxl(path: &Path, dom: &WeakDom) -> Result<()> {
-    eprintln!("Writing RBXL: {}", path.display());
+fn write_roblox_binary(path: &Path, dom: &WeakDom, input_format: RobloxFileFormat) -> Result<()> {
+    eprintln!("Writing {}: {}", input_format.as_name(), path.display());
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -703,12 +804,21 @@ fn write_rbxl(path: &Path, dom: &WeakDom) -> Result<()> {
     {
         let output = BufWriter::new(&mut temp);
         let top_level_refs = dom.root().children().to_vec();
-        rbx_binary::to_writer(output, dom, &top_level_refs)
-            .with_context(|| format!("failed to write temporary RBXL for {}", path.display()))?;
+        rbx_binary::to_writer(output, dom, &top_level_refs).with_context(|| {
+            format!(
+                "failed to write temporary Roblox binary for {}",
+                path.display()
+            )
+        })?;
     }
     temp.persist(path)
         .map_err(|error| error.error)
-        .with_context(|| format!("failed to move temporary RBXL into {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to move temporary Roblox binary into {}",
+                path.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -794,22 +904,75 @@ fn sanitize_filename(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::Cell, env, sync::Mutex};
 
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    #[derive(Debug)]
+    struct FakePrometheusRuntime {
+        available: bool,
+        internet_available: bool,
+        install_fails: bool,
+        update_fails: bool,
+        now: SystemTime,
+        availability_checks: usize,
+        install_calls: usize,
+        update_calls: usize,
+        internet_checks: usize,
+    }
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    #[cfg(unix)]
-    fn write_fake_executable(path: &Path) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
+    impl Default for FakePrometheusRuntime {
+        fn default() -> Self {
+            Self {
+                available: true,
+                internet_available: true,
+                install_fails: false,
+                update_fails: false,
+                now: fixed_now(),
+                availability_checks: 0,
+                install_calls: 0,
+                update_calls: 0,
+                internet_checks: 0,
+            }
         }
-        fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    impl PrometheusRuntime for FakePrometheusRuntime {
+        fn prometheus_available(&mut self) -> Result<bool> {
+            self.availability_checks += 1;
+            Ok(self.available)
+        }
+
+        fn install_prometheus(&mut self) -> Result<()> {
+            self.install_calls += 1;
+            if self.install_fails {
+                bail!("install failed in test");
+            }
+            self.available = true;
+            Ok(())
+        }
+
+        fn update_prometheus(&mut self) -> Result<()> {
+            self.update_calls += 1;
+            if self.update_fails {
+                bail!("update failed in test");
+            }
+            Ok(())
+        }
+
+        fn internet_available(&mut self) -> bool {
+            self.internet_checks += 1;
+            self.internet_available
+        }
+
+        fn now(&self) -> SystemTime {
+            self.now
+        }
+    }
+
+    fn fixed_now() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(2_000_000_000)
+    }
+
+    fn stale_time() -> SystemTime {
+        fixed_now() - PROMETHEUS_UPDATE_INTERVAL - Duration::from_secs(1)
     }
 
     #[test]
@@ -864,6 +1027,40 @@ mod tests {
     }
 
     #[test]
+    fn default_output_path_preserves_extension_and_formats_level() {
+        assert_eq!(
+            default_output_path(
+                Path::new("/tmp/Ro-Translink.rbxl"),
+                ObfuscationLevel::Medium
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/Ro-Translink-obfuscated_Medium.rbxl")
+        );
+        assert_eq!(
+            default_output_path(Path::new("Model.rbxm"), ObfuscationLevel::High).unwrap(),
+            PathBuf::from("Model-obfuscated_High.rbxm")
+        );
+    }
+
+    #[test]
+    fn rbxl_and_rbxm_extensions_are_supported() {
+        assert_eq!(
+            validate_input_format(Path::new("place.rbxl")).unwrap(),
+            RobloxFileFormat::Rbxl
+        );
+        assert_eq!(
+            validate_input_format(Path::new("model.RBXM")).unwrap(),
+            RobloxFileFormat::Rbxm
+        );
+    }
+
+    #[test]
+    fn unknown_input_extension_is_rejected() {
+        let error = validate_input_format(Path::new("model.rbxmx")).unwrap_err();
+        assert!(format!("{error:#}").contains("expected .rbxl or .rbxm"));
+    }
+
+    #[test]
     fn levels_map_to_prometheus_presets() {
         assert_eq!(
             prometheus_preset_for_level(ObfuscationLevel::Minimal),
@@ -912,104 +1109,118 @@ mod tests {
 
     #[test]
     fn dry_run_resolver_does_not_install_or_verify_prometheus() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var(PROMETHEUS_ENV_VAR);
-        let dir = tempfile::tempdir().unwrap();
-        let installer_called = Cell::new(false);
+        let mut runtime = FakePrometheusRuntime {
+            available: false,
+            ..Default::default()
+        };
 
-        let path = resolve_or_install_prometheus_with(dir.path(), true, |_| {
-            installer_called.set(true);
-            Err(anyhow!("installer should not run during dry-run"))
-        })
-        .unwrap();
+        let path = resolve_or_install_prometheus_with(true, None, &mut runtime).unwrap();
 
-        assert!(!installer_called.get());
-        assert_eq!(path, project_local_prometheus_path(dir.path()));
-        assert!(!path.exists());
+        assert_eq!(path, PathBuf::from(PROMETHEUS_COMMAND));
+        assert_eq!(runtime.availability_checks, 0);
+        assert_eq!(runtime.install_calls, 0);
+        assert_eq!(runtime.update_calls, 0);
     }
 
     #[test]
-    #[cfg(unix)]
-    fn resolver_prefers_prometheus_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var(PROMETHEUS_ENV_VAR);
+    fn missing_prometheus_attempts_install() {
         let dir = tempfile::tempdir().unwrap();
-        let env_path = dir.path().join("custom-prometheus-lua");
-        let local_path = project_local_prometheus_path(dir.path());
-        write_fake_executable(&env_path);
-        write_fake_executable(&local_path);
-        env::set_var(PROMETHEUS_ENV_VAR, &env_path);
+        let state_file = dir.path().join(PROMETHEUS_UPDATE_STATE_FILE);
+        let mut runtime = FakePrometheusRuntime {
+            available: false,
+            ..Default::default()
+        };
 
-        let resolved = resolve_or_install_prometheus_with(dir.path(), false, |_| {
-            Err(anyhow!("installer should not run when env var is set"))
-        })
-        .unwrap();
+        let resolved =
+            resolve_or_install_prometheus_with(false, Some(&state_file), &mut runtime).unwrap();
 
-        env::remove_var(PROMETHEUS_ENV_VAR);
-        assert_eq!(resolved, env_path);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn resolver_uses_repo_local_prometheus_binary() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var(PROMETHEUS_ENV_VAR);
-        let dir = tempfile::tempdir().unwrap();
-        let local_path = project_local_prometheus_path(dir.path());
-        write_fake_executable(&local_path);
-
-        let resolved = resolve_or_install_prometheus_with(dir.path(), false, |_| {
-            Err(anyhow!("installer should not run when local binary exists"))
-        })
-        .unwrap();
-
-        assert_eq!(resolved, local_path);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn missing_local_binary_in_non_dry_run_attempts_install() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var(PROMETHEUS_ENV_VAR);
-        let dir = tempfile::tempdir().unwrap();
-        let installer_called = Cell::new(false);
-
-        let resolved = resolve_or_install_prometheus_with(dir.path(), false, |root| {
-            installer_called.set(true);
-            let local_path = project_local_prometheus_path(root);
-            write_fake_executable(&local_path);
-            Ok(local_path)
-        })
-        .unwrap();
-
-        assert!(installer_called.get());
-        assert_eq!(resolved, project_local_prometheus_path(dir.path()));
+        assert_eq!(resolved, PathBuf::from(PROMETHEUS_COMMAND));
+        assert_eq!(runtime.install_calls, 1);
+        assert_eq!(runtime.availability_checks, 2);
+        assert_eq!(
+            read_prometheus_update_timestamp(&state_file).unwrap(),
+            Some(fixed_now())
+        );
     }
 
     #[test]
     fn failed_install_returns_clear_error() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var(PROMETHEUS_ENV_VAR);
-        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = FakePrometheusRuntime {
+            available: false,
+            install_fails: true,
+            ..Default::default()
+        };
 
-        let error = resolve_or_install_prometheus_with(dir.path(), false, |_| {
-            Err(anyhow!("download failed in test"))
-        })
-        .unwrap_err();
+        let error = resolve_or_install_prometheus_with(false, None, &mut runtime).unwrap_err();
         let error = format!("{error:#}");
 
-        assert!(error.contains("failed to install Prometheus locally"));
-        assert!(error.contains(".tools/prometheus-lua"));
-        assert!(error.contains(PROMETHEUS_ENV_VAR));
+        assert!(error.contains("failed to install Prometheus"));
+        assert!(error.contains(PROMETHEUS_INSTALL_COMMAND));
     }
 
     #[test]
-    fn tools_directory_is_ignored_by_git() {
-        let gitignore = fs::read_to_string(".gitignore").unwrap();
-        assert!(gitignore
-            .lines()
-            .map(str::trim)
-            .any(|line| line == ".tools/" || line == "/.tools/"));
+    fn fresh_prometheus_install_does_not_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join(PROMETHEUS_UPDATE_STATE_FILE);
+        write_prometheus_update_timestamp(Some(&state_file), fixed_now()).unwrap();
+        let mut runtime = FakePrometheusRuntime::default();
+
+        resolve_or_install_prometheus_with(false, Some(&state_file), &mut runtime).unwrap();
+
+        assert_eq!(runtime.internet_checks, 0);
+        assert_eq!(runtime.update_calls, 0);
+        assert_eq!(runtime.install_calls, 0);
+    }
+
+    #[test]
+    fn stale_prometheus_install_skips_update_when_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join(PROMETHEUS_UPDATE_STATE_FILE);
+        write_prometheus_update_timestamp(Some(&state_file), stale_time()).unwrap();
+        let mut runtime = FakePrometheusRuntime {
+            internet_available: false,
+            ..Default::default()
+        };
+
+        resolve_or_install_prometheus_with(false, Some(&state_file), &mut runtime).unwrap();
+
+        assert_eq!(runtime.internet_checks, 1);
+        assert_eq!(runtime.update_calls, 0);
+        assert_eq!(runtime.install_calls, 0);
+    }
+
+    #[test]
+    fn stale_prometheus_install_updates_when_online() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join(PROMETHEUS_UPDATE_STATE_FILE);
+        write_prometheus_update_timestamp(Some(&state_file), stale_time()).unwrap();
+        let mut runtime = FakePrometheusRuntime::default();
+
+        resolve_or_install_prometheus_with(false, Some(&state_file), &mut runtime).unwrap();
+
+        assert_eq!(runtime.internet_checks, 1);
+        assert_eq!(runtime.update_calls, 1);
+        assert_eq!(runtime.install_calls, 0);
+        assert_eq!(
+            read_prometheus_update_timestamp(&state_file).unwrap(),
+            Some(fixed_now())
+        );
+    }
+
+    #[test]
+    fn failed_prometheus_update_falls_back_to_installer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join(PROMETHEUS_UPDATE_STATE_FILE);
+        write_prometheus_update_timestamp(Some(&state_file), stale_time()).unwrap();
+        let mut runtime = FakePrometheusRuntime {
+            update_fails: true,
+            ..Default::default()
+        };
+
+        resolve_or_install_prometheus_with(false, Some(&state_file), &mut runtime).unwrap();
+
+        assert_eq!(runtime.update_calls, 1);
+        assert_eq!(runtime.install_calls, 1);
     }
 
     #[test]
