@@ -1,0 +1,4 @@
+/target/
+/.tools/
+AGENTS.md
+Cargo.lock
