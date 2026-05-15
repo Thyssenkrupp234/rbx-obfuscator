@@ -26,6 +26,8 @@ const PROMETHEUS_INSTALL_COMMAND: &str =
     "curl -fsSL https://raw.githubusercontent.com/prometheus-lua/Prometheus/master/install.sh | sh";
 const PROMETHEUS_UPDATE_STATE_FILE: &str = "prometheus-last-update";
 const PROMETHEUS_UPDATE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const LUAU_IF_HELPER_NAME: &str = "__rbx_obfuscator_luau_if";
+const LUAU_IF_HELPER: &str = "local function __rbx_obfuscator_luau_if(condition, truthy, falsy)\n\tif condition then\n\t\treturn truthy()\n\tend\n\treturn falsy()\nend\n\n";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,7 +140,7 @@ struct ManifestEntry {
     action: ManifestAction,
     source_bytes: usize,
     transformed_bytes: Option<usize>,
-    type_annotations_stripped: bool,
+    luau_compatibility_applied: bool,
     backup_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -163,7 +165,7 @@ struct FailedScript {
 #[derive(Debug)]
 struct PrometheusFailure {
     error: anyhow::Error,
-    type_annotations_stripped: bool,
+    luau_compatibility_applied: bool,
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -237,7 +239,7 @@ pub fn run(options: Options) -> Result<()> {
                 action: ManifestAction::Skipped,
                 source_bytes: script.source.len(),
                 transformed_bytes: None,
-                type_annotations_stripped: false,
+                luau_compatibility_applied: false,
                 backup_path: None,
                 error: None,
             });
@@ -256,7 +258,7 @@ pub fn run(options: Options) -> Result<()> {
                 action: ManifestAction::DryRun,
                 source_bytes: script.source.len(),
                 transformed_bytes: None,
-                type_annotations_stripped: options.strip_types,
+                luau_compatibility_applied: options.strip_types,
                 backup_path: None,
                 error: None,
             });
@@ -277,7 +279,7 @@ pub fn run(options: Options) -> Result<()> {
             .as_ref()
             .expect("Prometheus temp dir must exist outside dry-run")
             .path();
-        let (transformed, type_annotations_stripped) = match run_prometheus_with_type_fallback(
+        let (transformed, luau_compatibility_applied) = match run_prometheus_with_type_fallback(
             &prometheus_path,
             &script.source,
             options.obfuscation_level,
@@ -304,7 +306,7 @@ pub fn run(options: Options) -> Result<()> {
                     action: ManifestAction::Failed,
                     source_bytes: script.source.len(),
                     transformed_bytes: None,
-                    type_annotations_stripped: failure.type_annotations_stripped,
+                    luau_compatibility_applied: failure.luau_compatibility_applied,
                     backup_path,
                     error: Some(error),
                 });
@@ -326,7 +328,7 @@ pub fn run(options: Options) -> Result<()> {
             action: ManifestAction::Processed,
             source_bytes: script.source.len(),
             transformed_bytes: Some(transformed.len()),
-            type_annotations_stripped,
+            luau_compatibility_applied,
             backup_path,
             error: None,
         });
@@ -695,37 +697,37 @@ fn run_prometheus_with_type_fallback(
     script_path: &str,
 ) -> std::result::Result<(String, bool), PrometheusFailure> {
     if strip_types {
-        let stripped = strip_luau_type_annotations(input_source);
-        return run_prometheus(prometheus_path, &stripped, level, temp_dir)
+        let prepared = prepare_luau_for_prometheus(input_source);
+        return run_prometheus(prometheus_path, &prepared, level, temp_dir)
             .map(|transformed| (transformed, true))
             .map_err(|error| PrometheusFailure {
                 error,
-                type_annotations_stripped: true,
+                luau_compatibility_applied: true,
             });
     }
 
     match run_prometheus(prometheus_path, input_source, level, temp_dir) {
         Ok(transformed) => Ok((transformed, false)),
         Err(original_error) => {
-            let stripped = strip_luau_type_annotations(input_source);
-            if stripped == input_source {
+            let prepared = prepare_luau_for_prometheus(input_source);
+            if prepared == input_source {
                 return Err(PrometheusFailure {
                     error: original_error,
-                    type_annotations_stripped: false,
+                    luau_compatibility_applied: false,
                 });
             }
 
             eprintln!(
-                "Prometheus failed for {}; retrying after stripping Luau type annotations",
+                "Prometheus failed for {}; retrying after applying Luau compatibility preprocessing",
                 script_path
             );
-            run_prometheus(prometheus_path, &stripped, level, temp_dir)
+            run_prometheus(prometheus_path, &prepared, level, temp_dir)
                 .map(|transformed| (transformed, true))
                 .map_err(|fallback_error| PrometheusFailure {
                     error: anyhow!(
-                        "Prometheus also failed after stripping Luau type annotations; original error: {original_error:#}; fallback error: {fallback_error:#}"
+                        "Prometheus also failed after Luau compatibility preprocessing; original error: {original_error:#}; fallback error: {fallback_error:#}"
                     ),
-                    type_annotations_stripped: true,
+                    luau_compatibility_applied: true,
                 })
         }
     }
@@ -819,6 +821,7 @@ fn prometheus_args_for(
         OsString::from("--out"),
         output_file.as_os_str().to_owned(),
         OsString::from("--nocolors"),
+        OsString::from("--saveerrors"),
         input_file.as_os_str().to_owned(),
     ]
 }
@@ -835,6 +838,21 @@ fn first_error_line(error: &str) -> &str {
         .find(|line| !line.trim().is_empty())
         .unwrap_or("unknown error")
         .trim()
+}
+
+fn prepare_luau_for_prometheus(source: &str) -> String {
+    let stripped = strip_luau_type_annotations(source);
+    let (without_interpolated_strings, lowered_strings) =
+        lower_luau_interpolated_strings(&stripped);
+    let (lowered, lowered_if_expressions) =
+        lower_luau_if_expressions(&without_interpolated_strings);
+    if lowered_if_expressions {
+        insert_luau_if_helper(&lowered)
+    } else if lowered_strings {
+        without_interpolated_strings
+    } else {
+        lowered
+    }
 }
 
 fn strip_luau_type_annotations(source: &str) -> String {
@@ -924,6 +942,15 @@ fn strip_luau_type_annotations_from_code(code: &str) -> String {
             }
         }
 
+        if is_keyword_at(code, index, "for") {
+            if let Some((replacement, next_index)) = strip_for_statement_variable_types(code, index)
+            {
+                output.push_str(&replacement);
+                index = next_index;
+                continue;
+            }
+        }
+
         if is_keyword_at(code, index, "function") {
             if let Some((replacement, next_index)) = strip_function_signature(code, index) {
                 output.push_str(&replacement);
@@ -973,6 +1000,24 @@ fn strip_local_declaration(code: &str, start: usize) -> (String, usize) {
     }
 }
 
+fn strip_for_statement_variable_types(code: &str, start: usize) -> Option<(String, usize)> {
+    let after_for = start + "for".len();
+    let in_index = find_top_level_keyword(code, after_for, "in")?;
+    let variables = &code[after_for..in_index];
+    let trimmed_len = variables.trim_end_matches([' ', '\t', '\r']).len();
+    let mut stripped = strip_type_suffixes(&variables[..trimmed_len], b",");
+    stripped.push_str(&variables[trimmed_len..]);
+
+    if stripped == variables {
+        return None;
+    }
+
+    let mut output = String::with_capacity(in_index - start);
+    output.push_str(&code[start..after_for]);
+    output.push_str(&stripped);
+    Some((output, in_index))
+}
+
 fn strip_function_signature(code: &str, start: usize) -> Option<(String, usize)> {
     let bytes = code.as_bytes();
     let open_paren = bytes[start..]
@@ -1013,6 +1058,7 @@ fn strip_type_suffixes(segment: &str, terminators: &[u8]) -> String {
             && previous_non_whitespace_is_identifier(segment, index)
             && next_non_whitespace_starts_type(segment, index + 1)
         {
+            trim_inline_whitespace_end(&mut output);
             index = skip_type_annotation(segment, index + 1, terminators);
             continue;
         }
@@ -1338,6 +1384,12 @@ fn skip_inline_whitespace_back(bytes: &[u8], mut index: usize) -> usize {
     index
 }
 
+fn trim_inline_whitespace_end(value: &mut String) {
+    while value.ends_with([' ', '\t', '\r']) {
+        value.pop();
+    }
+}
+
 fn previous_non_whitespace_is_identifier(segment: &str, index: usize) -> bool {
     segment.as_bytes()[..index]
         .iter()
@@ -1368,6 +1420,333 @@ fn push_next_char(source: &str, output: &mut String, index: &mut usize) {
         .expect("index must be at a character boundary");
     output.push(ch);
     *index += ch.len_utf8();
+}
+
+fn lower_luau_interpolated_strings(source: &str) -> (String, bool) {
+    let bytes = source.as_bytes();
+    let mut output = String::with_capacity(source.len());
+    let mut index = 0usize;
+    let mut changed = false;
+
+    while index < bytes.len() {
+        if bytes[index] == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            let end = if let Some(open_len) = long_bracket_open(bytes, index + 2) {
+                find_long_bracket_end(bytes, index + 2 + open_len, open_len - 2)
+                    .unwrap_or(bytes.len())
+            } else {
+                find_line_end(bytes, index)
+            };
+            output.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+
+        if matches!(bytes[index], b'\'' | b'"') {
+            let end = find_quoted_string_end(bytes, index);
+            output.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+
+        if bytes[index] == b'`' {
+            if let Some((replacement, end)) = parse_luau_interpolated_string(source, index) {
+                output.push_str(&replacement);
+                index = end;
+                changed = true;
+                continue;
+            }
+        }
+
+        if let Some(open_len) = long_bracket_open(bytes, index) {
+            let end =
+                find_long_bracket_end(bytes, index + open_len, open_len - 2).unwrap_or(bytes.len());
+            output.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+
+        push_next_char(source, &mut output, &mut index);
+    }
+
+    (output, changed)
+}
+
+fn parse_luau_interpolated_string(source: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    let mut index = start + 1;
+    let mut literal_start = index;
+    let mut parts = Vec::new();
+    let mut interpolated = false;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index = (index + 2).min(bytes.len());
+            }
+            b'`' => {
+                push_lua_string_part(&source[literal_start..index], &mut parts);
+                let replacement = if interpolated {
+                    format!("({})", parts.join(" .. "))
+                } else {
+                    lua_quote(&source[literal_start..index])
+                };
+                return Some((replacement, index + 1));
+            }
+            b'{' => {
+                push_lua_string_part(&source[literal_start..index], &mut parts);
+                let expression_end = find_interpolation_expression_end(source, index + 1)?;
+                let expression = source[index + 1..expression_end].trim();
+                parts.push(format!("tostring({expression})"));
+                interpolated = true;
+                index = expression_end + 1;
+                literal_start = index;
+            }
+            _ => index += 1,
+        }
+    }
+
+    None
+}
+
+fn push_lua_string_part(part: &str, parts: &mut Vec<String>) {
+    if !part.is_empty() {
+        parts.push(lua_quote(part));
+    }
+}
+
+fn lua_quote(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\\""),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            _ => output.push(ch),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn find_interpolation_expression_end(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = start;
+    let mut depth = 0usize;
+
+    while index < bytes.len() {
+        if let Some(end) = skip_luau_literal_or_comment(source, index) {
+            index = end;
+            continue;
+        }
+
+        match bytes[index] {
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' if depth == 0 => return Some(index),
+            b'}' | b')' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+#[derive(Debug)]
+struct LuauIfExpression<'a> {
+    condition: &'a str,
+    true_expression: &'a str,
+    false_expression: &'a str,
+    end: usize,
+}
+
+fn lower_luau_if_expressions(source: &str) -> (String, bool) {
+    let bytes = source.as_bytes();
+    let mut output = String::with_capacity(source.len());
+    let mut index = 0usize;
+    let mut changed = false;
+
+    while index < bytes.len() {
+        if let Some(end) = skip_luau_literal_or_comment(source, index) {
+            output.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+
+        if is_keyword_at(source, index, "if") && is_expression_if_start(source, index) {
+            if let Some(if_expression) = parse_luau_if_expression(source, index) {
+                output.push_str(&format_luau_if_expression(&if_expression));
+                index = if_expression.end;
+                changed = true;
+                continue;
+            }
+        }
+
+        push_next_char(source, &mut output, &mut index);
+    }
+
+    (output, changed)
+}
+
+fn format_luau_if_expression(if_expression: &LuauIfExpression<'_>) -> String {
+    let (condition, _) = lower_luau_if_expressions(if_expression.condition.trim());
+    let (true_expression, _) = lower_luau_if_expressions(if_expression.true_expression.trim());
+    let (false_expression, _) = lower_luau_if_expressions(if_expression.false_expression.trim());
+
+    format!(
+        "{LUAU_IF_HELPER_NAME}(({condition}), function() return {true_expression} end, function() return {false_expression} end)"
+    )
+}
+
+fn parse_luau_if_expression(source: &str, start: usize) -> Option<LuauIfExpression<'_>> {
+    let condition_start = skip_whitespace(source, start + "if".len());
+    let then_index = find_top_level_keyword(source, condition_start, "then")?;
+    let true_start = skip_whitespace(source, then_index + "then".len());
+    let else_index = find_top_level_keyword(source, true_start, "else")?;
+    let false_start = skip_whitespace(source, else_index + "else".len());
+    let end = find_luau_if_expression_end(source, false_start);
+
+    if condition_start == then_index || true_start == else_index || false_start == end {
+        return None;
+    }
+
+    Some(LuauIfExpression {
+        condition: &source[condition_start..then_index],
+        true_expression: &source[true_start..else_index],
+        false_expression: &source[false_start..end],
+        end,
+    })
+}
+
+fn find_top_level_keyword(source: &str, start: usize, keyword: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = start;
+    let mut depth = 0usize;
+
+    while index < bytes.len() {
+        if let Some(end) = skip_luau_literal_or_comment(source, index) {
+            index = end;
+            continue;
+        }
+
+        if depth == 0 && is_keyword_at(source, index, keyword) {
+            return Some(index);
+        }
+
+        match bytes[index] {
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth = depth.saturating_sub(1),
+            b'\n' | b';' if depth == 0 => return None,
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn find_luau_if_expression_end(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut index = start;
+    let mut depth = 0usize;
+
+    while index < bytes.len() {
+        if let Some(end) = skip_luau_literal_or_comment(source, index) {
+            index = end;
+            continue;
+        }
+
+        if depth == 0 && matches!(bytes[index], b'\n' | b';' | b',' | b')' | b']' | b'}') {
+            break;
+        }
+
+        match bytes[index] {
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    index
+}
+
+fn skip_luau_literal_or_comment(source: &str, index: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(index) == Some(&b'-') && bytes.get(index + 1) == Some(&b'-') {
+        if let Some(open_len) = long_bracket_open(bytes, index + 2) {
+            return Some(
+                find_long_bracket_end(bytes, index + 2 + open_len, open_len - 2)
+                    .unwrap_or(bytes.len()),
+            );
+        }
+        return Some(find_line_end(bytes, index));
+    }
+
+    if matches!(bytes.get(index), Some(b'\'' | b'"' | b'`')) {
+        return Some(find_quoted_string_end(bytes, index));
+    }
+
+    long_bracket_open(bytes, index).map(|open_len| {
+        find_long_bracket_end(bytes, index + open_len, open_len - 2).unwrap_or(bytes.len())
+    })
+}
+
+fn is_expression_if_start(source: &str, index: usize) -> bool {
+    let bytes = source.as_bytes();
+    let Some(previous_index) = bytes[..index]
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+    else {
+        return false;
+    };
+
+    match bytes[previous_index] {
+        b'=' | b'(' | b'[' | b'{' | b',' | b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'<'
+        | b'>' => return true,
+        b'\n' | b';' => return false,
+        _ => {}
+    }
+
+    keyword_ends_at(source, previous_index + 1, "return")
+        || keyword_ends_at(source, previous_index + 1, "and")
+        || keyword_ends_at(source, previous_index + 1, "or")
+        || keyword_ends_at(source, previous_index + 1, "not")
+}
+
+fn keyword_ends_at(source: &str, end: usize, keyword: &str) -> bool {
+    end >= keyword.len() && is_keyword_at(source, end - keyword.len(), keyword)
+}
+
+fn insert_luau_if_helper(source: &str) -> String {
+    let insert_at = luau_helper_insert_index(source);
+    let mut output = String::with_capacity(source.len() + LUAU_IF_HELPER.len());
+    output.push_str(&source[..insert_at]);
+    output.push_str(LUAU_IF_HELPER);
+    output.push_str(&source[insert_at..]);
+    output
+}
+
+fn luau_helper_insert_index(source: &str) -> usize {
+    let mut index = 0usize;
+
+    while source[index..].starts_with("--!") {
+        let line_end = source[index..]
+            .find('\n')
+            .map(|offset| index + offset + 1)
+            .unwrap_or(source.len());
+        index = line_end;
+        if index >= source.len() {
+            break;
+        }
+    }
+
+    index
 }
 
 fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
@@ -1694,6 +2073,7 @@ mod tests {
                 OsString::from("--out"),
                 OsString::from("output.luau"),
                 OsString::from("--nocolors"),
+                OsString::from("--saveerrors"),
                 OsString::from("input.luau"),
             ]
         );
@@ -1722,6 +2102,7 @@ end
 function Controller:Start(player: Player): () return self:Run(player) end
 local f: (number) -> string = function(value: number): string return tostring(value) end
 function id<T>(value: T): T return value end
+for _, Car : Model in pairs(Cars:GetChildren()) do print(Car) end
 ";
         let expected = "\
 local function getBus(bus, route)
@@ -1730,6 +2111,7 @@ end
 function Controller:Start(player) return self:Run(player) end
 local f = function(value) return tostring(value) end
 function id(value) return value end
+for _, Car in pairs(Cars:GetChildren()) do print(Car) end
 ";
 
         assert_eq!(strip_luau_type_annotations(source), expected);
@@ -1768,6 +2150,77 @@ object:Method(script.Bus)
 ";
 
         assert_eq!(strip_luau_type_annotations(source), source);
+    }
+
+    #[test]
+    fn prepare_luau_for_prometheus_handles_ro_translink_type_patterns() {
+        let source = "\
+--!strict
+function SheetValues.new(SpreadId: string, SheetId: string?)
+    local GUID = SHA1(SpreadId .. \"||\" .. SheetId :: string)
+    function SheetManager:GetValue(Name: string, Default: any?)
+        return if value ~= nil then value else Default
+    end
+end
+";
+
+        let prepared = prepare_luau_for_prometheus(source);
+
+        assert!(prepared.starts_with("--!strict\nlocal function __rbx_obfuscator_luau_if"));
+        assert!(prepared.contains("function SheetValues.new(SpreadId, SheetId)"));
+        assert!(prepared.contains("local GUID = SHA1(SpreadId .. \"||\" .. SheetId )"));
+        assert!(prepared.contains("function SheetManager:GetValue(Name, Default)"));
+        assert!(prepared.contains(
+            "return __rbx_obfuscator_luau_if((value ~= nil), function() return value end, function() return Default end)"
+        ));
+        assert!(!prepared.contains("string?"));
+        assert!(!prepared.contains("any?"));
+        assert!(!prepared.contains(":: string"));
+    }
+
+    #[test]
+    fn prepare_luau_for_prometheus_lowers_if_expressions() {
+        let source = "\
+local animator = if Humanoid then Humanoid:FindFirstChildOfClass(\"Animator\") else nil
+local Value = ConvertTyped(if Comp.v ~= nil then Comp.v else \"\")
+local heightScale = if userAnimateScaleRun then getHeightScale() else 1
+";
+
+        let prepared = prepare_luau_for_prometheus(source);
+
+        assert!(prepared.contains(LUAU_IF_HELPER));
+        assert!(prepared.contains(
+            "local animator = __rbx_obfuscator_luau_if((Humanoid), function() return Humanoid:FindFirstChildOfClass(\"Animator\") end, function() return nil end)"
+        ));
+        assert!(prepared.contains(
+            "local Value = ConvertTyped(__rbx_obfuscator_luau_if((Comp.v ~= nil), function() return Comp.v end, function() return \"\" end))"
+        ));
+        assert!(prepared.contains(
+            "local heightScale = __rbx_obfuscator_luau_if((userAnimateScaleRun), function() return getHeightScale() end, function() return 1 end)"
+        ));
+    }
+
+    #[test]
+    fn prepare_luau_for_prometheus_lowers_interpolated_strings() {
+        let source = "\
+error(`No MainModule found in {model.Parent:GetFullName()}`)
+local plain = `hello`
+";
+
+        let prepared = prepare_luau_for_prometheus(source);
+
+        assert!(prepared.contains(
+            "error((\"No MainModule found in \" .. tostring(model.Parent:GetFullName())))"
+        ));
+        assert!(prepared.contains("local plain = \"hello\""));
+        assert!(!prepared.contains('`'));
+    }
+
+    #[test]
+    fn prepare_luau_for_prometheus_preserves_statement_ifs() {
+        let source = "if success then return result else return nil end\n";
+
+        assert_eq!(prepare_luau_for_prometheus(source), source);
     }
 
     #[test]
