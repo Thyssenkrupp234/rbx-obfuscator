@@ -12,6 +12,12 @@ Install the latest version from GitHub:
 curl -fsSL https://raw.githubusercontent.com/Thyssenkrupp234/roblox-obfuscator/main/install.sh | sh
 ```
 
+The installer keeps normal output quiet and only shows one line per install step. To see the underlying `git`, Prometheus, and Cargo output, run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Thyssenkrupp234/roblox-obfuscator/main/install.sh | sh -s -- --verbose
+```
+
 The installer:
 
 - downloads or updates this repository from GitHub under `~/.rbxl-obfuscate/source`
