@@ -1,6 +1,6 @@
-# rbxl-obfuscate
+# rbx-obfuscator
 
-`rbxl-obfuscate` is a Roblox binary release tool for place and model files. It reads `.rbxl` place files and `.rbxm` model files, finds every `Script`, `LocalScript`, and `ModuleScript`, runs each Luau `Source` property through Prometheus, replaces the source in the DOM, and writes a new Roblox binary file.
+`rbx-obfuscator` is a Roblox binary release tool for place and model files. It reads `.rbxl` place files and `.rbxm` model files, finds every `Script`, `LocalScript`, and `ModuleScript`, runs each Luau `Source` property through Prometheus, replaces the source in the DOM, and writes a new Roblox binary file.
 
 It does not use Rojo and does not require Roblox Studio for the normal workflow.
 
@@ -20,11 +20,11 @@ curl -fsSL https://raw.githubusercontent.com/Thyssenkrupp234/roblox-obfuscator/m
 
 The installer:
 
-- downloads or updates this repository from GitHub under `~/.rbxl-obfuscate/source`
+- downloads or updates this repository from GitHub under `~/.rbx-obfuscator/source`
 - installs Rust with `rustup` if `cargo` is missing
 - installs or updates Prometheus
 - builds the release binary
-- installs `rbxl-obfuscate` to `~/.local/bin`
+- installs `rbx-obfuscator` to `~/.local/bin`
 - adds `~/.local/bin` to `PATH` in your shell profile
 
 The one-line installer fetches `install.sh` from GitHub. If you already have a checkout, you can also run:
@@ -36,10 +36,10 @@ The one-line installer fetches `install.sh` from GitHub. If you already have a c
 Installer settings can be overridden with environment variables:
 
 ```bash
-RBXL_OBFUSCATE_REPO_URL=https://github.com/Thyssenkrupp234/roblox-obfuscator.git
-RBXL_OBFUSCATE_BRANCH=main
-RBXL_OBFUSCATE_INSTALL_ROOT="$HOME/.rbxl-obfuscate"
-RBXL_OBFUSCATE_BIN_DIR="$HOME/.local/bin"
+RBX_OBFUSCATOR_REPO_URL=https://github.com/Thyssenkrupp234/roblox-obfuscator.git
+RBX_OBFUSCATOR_BRANCH=main
+RBX_OBFUSCATOR_INSTALL_ROOT="$HOME/.rbx-obfuscator"
+RBX_OBFUSCATOR_BIN_DIR="$HOME/.local/bin"
 ```
 
 Manual build:
@@ -59,7 +59,7 @@ Dry-run mode does not install, update, or launch Prometheus.
 Obfuscate a place file and write the default output next to the input:
 
 ```bash
-rbxl-obfuscate game.rbxl --level medium
+rbx-obfuscator game.rbxl --level medium
 ```
 
 For `game.rbxl`, that writes:
@@ -71,7 +71,7 @@ game-obfuscated_Medium.rbxl
 Obfuscate a model file with an explicit output path:
 
 ```bash
-rbxl-obfuscate input.rbxm --level high --output output.rbxm
+rbx-obfuscator input.rbxm --level high --output output.rbxm
 ```
 
 Options:
@@ -111,7 +111,7 @@ Recommended local validation:
 cargo fmt -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-rbxl-obfuscate game.rbxl --level medium --dry-run --manifest manifest.json
+rbx-obfuscator game.rbxl --level medium --dry-run --manifest manifest.json
 ```
 
 Then open `manifest.json` and confirm the expected scripts were processed or skipped. Keep `backups/` for comparing original sources when validating a release build.

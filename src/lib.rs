@@ -550,7 +550,7 @@ fn maybe_update_prometheus(
 
 fn create_prometheus_temp_dir() -> Result<tempfile::TempDir> {
     TempFileBuilder::new()
-        .prefix("rbxl-obfuscate-")
+        .prefix("rbx-obfuscator-")
         .tempdir()
         .context("failed to create temporary Prometheus workspace")
 }
@@ -559,7 +559,7 @@ fn prometheus_update_state_file() -> Option<PathBuf> {
     if let Some(state_home) = env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
         return Some(
             PathBuf::from(state_home)
-                .join("rbxl-obfuscate")
+                .join("rbx-obfuscator")
                 .join(PROMETHEUS_UPDATE_STATE_FILE),
         );
     }
@@ -570,7 +570,7 @@ fn prometheus_update_state_file() -> Option<PathBuf> {
             PathBuf::from(home)
                 .join(".local")
                 .join("state")
-                .join("rbxl-obfuscate")
+                .join("rbx-obfuscator")
                 .join(PROMETHEUS_UPDATE_STATE_FILE)
         })
 }
@@ -738,7 +738,7 @@ fn run_prometheus(
     temp_dir: &Path,
 ) -> Result<String> {
     let input_file = TempFileBuilder::new()
-        .prefix("rbxl-obfuscate-input-")
+        .prefix("rbx-obfuscator-input-")
         .suffix(".luau")
         .tempfile_in(temp_dir)
         .with_context(|| {
@@ -755,7 +755,7 @@ fn run_prometheus(
     })?;
 
     let output_file = TempFileBuilder::new()
-        .prefix("rbxl-obfuscate-output-")
+        .prefix("rbx-obfuscator-output-")
         .suffix(".luau")
         .tempfile_in(temp_dir)
         .with_context(|| {

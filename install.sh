@@ -1,28 +1,28 @@
 #!/bin/sh
 set -eu
 
-REPO_URL="${RBXL_OBFUSCATE_REPO_URL:-https://github.com/Thyssenkrupp234/roblox-obfuscator.git}"
-BRANCH="${RBXL_OBFUSCATE_BRANCH:-main}"
-INSTALL_ROOT="${RBXL_OBFUSCATE_INSTALL_ROOT:-$HOME/.rbxl-obfuscate}"
+REPO_URL="${RBX_OBFUSCATOR_REPO_URL:-https://github.com/Thyssenkrupp234/roblox-obfuscator.git}"
+BRANCH="${RBX_OBFUSCATOR_BRANCH:-main}"
+INSTALL_ROOT="${RBX_OBFUSCATOR_INSTALL_ROOT:-$HOME/.rbx-obfuscator}"
 SOURCE_DIR="$INSTALL_ROOT/source"
-BIN_DIR="${RBXL_OBFUSCATE_BIN_DIR:-$HOME/.local/bin}"
-BIN_NAME="rbxl-obfuscate"
+BIN_DIR="${RBX_OBFUSCATOR_BIN_DIR:-$HOME/.local/bin}"
+BIN_NAME="rbx-obfuscator"
 PROMETHEUS_INSTALL_URL="https://raw.githubusercontent.com/prometheus-lua/Prometheus/master/install.sh"
-VERBOSE="${RBXL_OBFUSCATE_VERBOSE:-0}"
+VERBOSE="${RBX_OBFUSCATOR_VERBOSE:-0}"
 
 usage() {
     cat <<EOF
-rbxl-obfuscate installer
+rbx-obfuscator installer
 
 Usage:
   install.sh [--verbose]
 
 Environment:
-  RBXL_OBFUSCATE_REPO_URL      Git repository URL
-  RBXL_OBFUSCATE_BRANCH        Branch to install
-  RBXL_OBFUSCATE_INSTALL_ROOT  Source checkout directory
-  RBXL_OBFUSCATE_BIN_DIR       Directory for the installed binary
-  RBXL_OBFUSCATE_VERBOSE=1     Show command output
+  RBX_OBFUSCATOR_REPO_URL      Git repository URL
+  RBX_OBFUSCATOR_BRANCH        Branch to install
+  RBX_OBFUSCATOR_INSTALL_ROOT  Source checkout directory
+  RBX_OBFUSCATOR_BIN_DIR       Directory for the installed binary
+  RBX_OBFUSCATOR_VERBOSE=1     Show command output
 EOF
 }
 
@@ -45,8 +45,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 title() {
-    printf '\n%s\n' "rbxl-obfuscate installer"
-    printf '%s\n\n' "======================"
+    printf '\n%s\n' "rbx-obfuscator installer"
+    printf '%s\n\n' "========================"
 }
 
 say() {
@@ -100,7 +100,7 @@ run_cmd() {
         exit 1
     fi
 
-    log_file="$(mktemp "${TMPDIR:-/tmp}/rbxl-obfuscate-install.XXXXXX")"
+    log_file="$(mktemp "${TMPDIR:-/tmp}/rbx-obfuscator-install.XXXXXX")"
     if "$@" >"$log_file" 2>&1; then
         rm -f "$log_file"
         ok
@@ -126,7 +126,7 @@ try_cmd() {
         return 1
     fi
 
-    log_file="$(mktemp "${TMPDIR:-/tmp}/rbxl-obfuscate-install.XXXXXX")"
+    log_file="$(mktemp "${TMPDIR:-/tmp}/rbx-obfuscator-install.XXXXXX")"
     if "$@" >"$log_file" 2>&1; then
         rm -f "$log_file"
         ok
@@ -153,7 +153,7 @@ run_shell() {
         exit 1
     fi
 
-    log_file="$(mktemp "${TMPDIR:-/tmp}/rbxl-obfuscate-install.XXXXXX")"
+    log_file="$(mktemp "${TMPDIR:-/tmp}/rbx-obfuscator-install.XXXXXX")"
     if sh -c "$command" >"$log_file" 2>&1; then
         rm -f "$log_file"
         ok
@@ -194,7 +194,7 @@ download_source() {
         run_cmd "Reset source checkout" git -C "$SOURCE_DIR" reset --hard "origin/$BRANCH"
     else
         if [ -e "$SOURCE_DIR" ]; then
-            die "$SOURCE_DIR exists but is not a git checkout. Move it aside or set RBXL_OBFUSCATE_INSTALL_ROOT."
+            die "$SOURCE_DIR exists but is not a git checkout. Move it aside or set RBX_OBFUSCATOR_INSTALL_ROOT."
         fi
         run_cmd "Download source" git clone --quiet --depth 1 --branch "$BRANCH" "$REPO_URL" "$SOURCE_DIR"
     fi
@@ -233,7 +233,7 @@ append_path_to_file() {
 
     {
         printf '\n'
-        printf '%s\n' '# Added by rbxl-obfuscate installer'
+        printf '%s\n' '# Added by rbx-obfuscator installer'
         printf '%s\n' "$path_line"
     } >>"$profile_file"
 }

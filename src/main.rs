@@ -81,13 +81,13 @@ mod tests {
 
     #[test]
     fn level_is_required() {
-        assert!(Cli::try_parse_from(["rbxl-obfuscate", "input.rbxl"]).is_err());
+        assert!(Cli::try_parse_from(["rbx-obfuscator", "input.rbxl"]).is_err());
     }
 
     #[test]
     fn output_is_optional() {
         let cli =
-            Cli::try_parse_from(["rbxl-obfuscate", "input.rbxm", "--level", "medium"]).unwrap();
+            Cli::try_parse_from(["rbx-obfuscator", "input.rbxm", "--level", "medium"]).unwrap();
 
         assert_eq!(cli.input, PathBuf::from("input.rbxm"));
         assert_eq!(cli.level, CliObfuscationLevel::Medium);
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn output_flag_is_supported() {
         let cli = Cli::try_parse_from([
-            "rbxl-obfuscate",
+            "rbx-obfuscator",
             "input.rbxl",
             "--level",
             "high",
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn strip_types_flag_is_supported() {
         let cli = Cli::try_parse_from([
-            "rbxl-obfuscate",
+            "rbx-obfuscator",
             "input.rbxl",
             "--level",
             "minimal",
