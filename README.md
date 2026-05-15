@@ -27,7 +27,7 @@ The installer:
 - installs `rbxl-obfuscate` to `~/.local/bin`
 - adds `~/.local/bin` to `PATH` in your shell profile
 
-Because this repository is private, the one-line installer requires GitHub access to the raw script URL. If you already have a checkout, you can also run:
+The one-line installer fetches `install.sh` from GitHub. If you already have a checkout, you can also run:
 
 ```bash
 ./install.sh
@@ -79,13 +79,16 @@ Options:
 - `--level <minimal|low|medium|high>`: required obfuscation complexity. Maps to a Prometheus preset.
 - `--output <path>`, `-o <path>`: output `.rbxl` or `.rbxm` path. Defaults to `<input-stem>-obfuscated_<Level>.<extension>`.
 - `--dry-run`: reports scripts that would be processed and the Prometheus preset that would be used, without running Prometheus or writing output.
+- `--strip-types`: removes Luau type annotations before every Prometheus run.
 - `--backup-dir <dir>`: writes original script sources as `.luau` files before replacement.
 - `--skip-path <path>`: skips an exact normalized Roblox instance path, such as `game.ServerScriptService.Main`. Can be passed more than once.
-- `--manifest <path>`: writes a JSON report of processed, skipped, failed, or dry-run scripts.
+- `--manifest <path>`: writes a JSON report of processed, skipped, failed, or dry-run scripts, including whether type annotations were stripped.
 
 The tool accepts only `.rbxl` and `.rbxm` inputs and refuses to write the output path when it resolves to the same file as the input.
 
-If Prometheus fails to process a script, that script is left unchanged in the output file. The run continues, and all failed script paths are printed at the end.
+Prometheus can fail on some Luau type syntax, such as `local Bus:ObjectValue = script.Bus`. By default, the tool only strips type annotations after Prometheus fails for a script, then retries that one script once. Use `--strip-types` to strip annotations before every Prometheus run.
+
+If Prometheus still fails to process a script, that script is left unchanged in the output file. The run continues, and all failed script paths are printed at the end.
 
 Prometheus preset mapping:
 

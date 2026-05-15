@@ -104,6 +104,7 @@ pub struct Options {
     pub output: Option<PathBuf>,
     pub obfuscation_level: ObfuscationLevel,
     pub dry_run: bool,
+    pub strip_types: bool,
     pub backup_dir: Option<PathBuf>,
     pub skip_paths: Vec<String>,
     pub manifest: Option<PathBuf>,
@@ -137,6 +138,7 @@ struct ManifestEntry {
     action: ManifestAction,
     source_bytes: usize,
     transformed_bytes: Option<usize>,
+    type_annotations_stripped: bool,
     backup_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -156,6 +158,12 @@ struct FailedScript {
     path: String,
     class_name: String,
     error: String,
+}
+
+#[derive(Debug)]
+struct PrometheusFailure {
+    error: anyhow::Error,
+    type_annotations_stripped: bool,
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -229,6 +237,7 @@ pub fn run(options: Options) -> Result<()> {
                 action: ManifestAction::Skipped,
                 source_bytes: script.source.len(),
                 transformed_bytes: None,
+                type_annotations_stripped: false,
                 backup_path: None,
                 error: None,
             });
@@ -247,6 +256,7 @@ pub fn run(options: Options) -> Result<()> {
                 action: ManifestAction::DryRun,
                 source_bytes: script.source.len(),
                 transformed_bytes: None,
+                type_annotations_stripped: options.strip_types,
                 backup_path: None,
                 error: None,
             });
@@ -267,15 +277,17 @@ pub fn run(options: Options) -> Result<()> {
             .as_ref()
             .expect("Prometheus temp dir must exist outside dry-run")
             .path();
-        let transformed = match run_prometheus(
+        let (transformed, type_annotations_stripped) = match run_prometheus_with_type_fallback(
             &prometheus_path,
             &script.source,
             options.obfuscation_level,
             temp_dir,
+            options.strip_types,
+            &script.path,
         ) {
-            Ok(transformed) => transformed,
-            Err(error) => {
-                let error = format!("{error:#}");
+            Ok(result) => result,
+            Err(failure) => {
+                let error = format!("{:#}", failure.error);
                 let summary = first_error_line(&error).to_owned();
                 eprintln!(
                     "Failed {}; leaving source unobfuscated: {}",
@@ -292,6 +304,7 @@ pub fn run(options: Options) -> Result<()> {
                     action: ManifestAction::Failed,
                     source_bytes: script.source.len(),
                     transformed_bytes: None,
+                    type_annotations_stripped: failure.type_annotations_stripped,
                     backup_path,
                     error: Some(error),
                 });
@@ -313,6 +326,7 @@ pub fn run(options: Options) -> Result<()> {
             action: ManifestAction::Processed,
             source_bytes: script.source.len(),
             transformed_bytes: Some(transformed.len()),
+            type_annotations_stripped,
             backup_path,
             error: None,
         });
@@ -672,6 +686,51 @@ fn is_script_class(class_name: &str) -> bool {
     SCRIPT_CLASSES.contains(&class_name)
 }
 
+fn run_prometheus_with_type_fallback(
+    prometheus_path: &Path,
+    input_source: &str,
+    level: ObfuscationLevel,
+    temp_dir: &Path,
+    strip_types: bool,
+    script_path: &str,
+) -> std::result::Result<(String, bool), PrometheusFailure> {
+    if strip_types {
+        let stripped = strip_luau_type_annotations(input_source);
+        return run_prometheus(prometheus_path, &stripped, level, temp_dir)
+            .map(|transformed| (transformed, true))
+            .map_err(|error| PrometheusFailure {
+                error,
+                type_annotations_stripped: true,
+            });
+    }
+
+    match run_prometheus(prometheus_path, input_source, level, temp_dir) {
+        Ok(transformed) => Ok((transformed, false)),
+        Err(original_error) => {
+            let stripped = strip_luau_type_annotations(input_source);
+            if stripped == input_source {
+                return Err(PrometheusFailure {
+                    error: original_error,
+                    type_annotations_stripped: false,
+                });
+            }
+
+            eprintln!(
+                "Prometheus failed for {}; retrying after stripping Luau type annotations",
+                script_path
+            );
+            run_prometheus(prometheus_path, &stripped, level, temp_dir)
+                .map(|transformed| (transformed, true))
+                .map_err(|fallback_error| PrometheusFailure {
+                    error: anyhow!(
+                        "Prometheus also failed after stripping Luau type annotations; original error: {original_error:#}; fallback error: {fallback_error:#}"
+                    ),
+                    type_annotations_stripped: true,
+                })
+        }
+    }
+}
+
 fn run_prometheus(
     prometheus_path: &Path,
     input_source: &str,
@@ -776,6 +835,539 @@ fn first_error_line(error: &str) -> &str {
         .find(|line| !line.trim().is_empty())
         .unwrap_or("unknown error")
         .trim()
+}
+
+fn strip_luau_type_annotations(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut output = String::with_capacity(source.len());
+    let mut normal_start = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if bytes[index] == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            output.push_str(&strip_luau_type_annotations_from_code(
+                &source[normal_start..index],
+            ));
+            let end = if let Some(open_len) = long_bracket_open(bytes, index + 2) {
+                find_long_bracket_end(bytes, index + 2 + open_len, open_len - 2)
+                    .unwrap_or(bytes.len())
+            } else {
+                find_line_end(bytes, index)
+            };
+            output.push_str(&source[index..end]);
+            index = end;
+            normal_start = end;
+            continue;
+        }
+
+        if matches!(bytes[index], b'\'' | b'"' | b'`') {
+            output.push_str(&strip_luau_type_annotations_from_code(
+                &source[normal_start..index],
+            ));
+            let end = find_quoted_string_end(bytes, index);
+            output.push_str(&source[index..end]);
+            index = end;
+            normal_start = end;
+            continue;
+        }
+
+        if let Some(open_len) = long_bracket_open(bytes, index) {
+            output.push_str(&strip_luau_type_annotations_from_code(
+                &source[normal_start..index],
+            ));
+            let end =
+                find_long_bracket_end(bytes, index + open_len, open_len - 2).unwrap_or(bytes.len());
+            output.push_str(&source[index..end]);
+            index = end;
+            normal_start = end;
+            continue;
+        }
+
+        index += 1;
+    }
+
+    output.push_str(&strip_luau_type_annotations_from_code(
+        &source[normal_start..],
+    ));
+    output
+}
+
+fn strip_luau_type_annotations_from_code(code: &str) -> String {
+    let bytes = code.as_bytes();
+    let mut output = String::with_capacity(code.len());
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if is_keyword_at(code, index, "export") && is_statement_start(code, index) {
+            if let Some((replacement, next_index)) = strip_type_alias(code, index) {
+                output.push_str(&replacement);
+                index = next_index;
+                continue;
+            }
+        }
+
+        if is_keyword_at(code, index, "type") && is_statement_start(code, index) {
+            if let Some((replacement, next_index)) = strip_type_alias(code, index) {
+                output.push_str(&replacement);
+                index = next_index;
+                continue;
+            }
+        }
+
+        if is_keyword_at(code, index, "local") {
+            let after_local = skip_whitespace(code, index + "local".len());
+            if !is_keyword_at(code, after_local, "function") {
+                let (replacement, next_index) = strip_local_declaration(code, index);
+                output.push_str(&replacement);
+                index = next_index;
+                continue;
+            }
+        }
+
+        if is_keyword_at(code, index, "function") {
+            if let Some((replacement, next_index)) = strip_function_signature(code, index) {
+                output.push_str(&replacement);
+                index = next_index;
+                continue;
+            }
+        }
+
+        if bytes[index] == b':' && bytes.get(index + 1) == Some(&b':') {
+            index = skip_type_annotation(code, index + 2, b"\n;,)]}+-*/%^=");
+            continue;
+        }
+
+        push_next_char(code, &mut output, &mut index);
+    }
+
+    output
+}
+
+fn strip_local_declaration(code: &str, start: usize) -> (String, usize) {
+    let bytes = code.as_bytes();
+    let line_end = bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| start + offset)
+        .unwrap_or(bytes.len());
+    let line = &code[start..line_end];
+    let assignment = line.as_bytes().iter().position(|byte| *byte == b'=');
+
+    let mut output = String::with_capacity(line.len());
+    match assignment {
+        Some(assignment) => {
+            let lhs = &line[..assignment];
+            let trimmed_len = lhs.trim_end_matches([' ', '\t', '\r']).len();
+            output.push_str(&strip_type_suffixes(&lhs[..trimmed_len], b","));
+            output.push_str(&lhs[trimmed_len..]);
+            output.push_str(&strip_luau_type_annotations_from_code(&line[assignment..]));
+        }
+        None => output.push_str(&strip_type_suffixes(line, b",")),
+    }
+
+    if line_end < bytes.len() {
+        output.push('\n');
+        (output, line_end + 1)
+    } else {
+        (output, line_end)
+    }
+}
+
+fn strip_function_signature(code: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = code.as_bytes();
+    let open_paren = bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'(')
+        .map(|offset| start + offset)?;
+    let close_paren = find_matching_paren(bytes, open_paren)?;
+
+    let mut output = String::new();
+    output.push_str(&strip_function_generics(&code[start..open_paren]));
+    output.push('(');
+    output.push_str(&strip_type_suffixes(
+        &code[open_paren + 1..close_paren],
+        b",",
+    ));
+    output.push(')');
+
+    let after_params = close_paren + 1;
+    let after_whitespace = skip_inline_whitespace(code, after_params);
+    if bytes.get(after_whitespace) == Some(&b':') && bytes.get(after_whitespace + 1) != Some(&b':')
+    {
+        output.push_str(&code[after_params..after_whitespace]);
+        let next_index = skip_function_return_annotation(code, after_whitespace + 1);
+        Some((output, next_index))
+    } else {
+        Some((output, after_params))
+    }
+}
+
+fn strip_type_suffixes(segment: &str, terminators: &[u8]) -> String {
+    let bytes = segment.as_bytes();
+    let mut output = String::with_capacity(segment.len());
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if bytes[index] == b':'
+            && bytes.get(index + 1) != Some(&b':')
+            && previous_non_whitespace_is_identifier(segment, index)
+            && next_non_whitespace_starts_type(segment, index + 1)
+        {
+            index = skip_type_annotation(segment, index + 1, terminators);
+            continue;
+        }
+
+        push_next_char(segment, &mut output, &mut index);
+    }
+
+    output
+}
+
+fn strip_type_alias(code: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = code.as_bytes();
+    let type_keyword = if is_keyword_at(code, start, "export") {
+        let after_export = skip_whitespace(code, start + "export".len());
+        if !is_keyword_at(code, after_export, "type") {
+            return None;
+        }
+        after_export
+    } else if is_keyword_at(code, start, "type") {
+        start
+    } else {
+        return None;
+    };
+
+    let name_start = skip_inline_whitespace(code, type_keyword + "type".len());
+    if name_start == type_keyword + "type".len()
+        || !bytes
+            .get(name_start)
+            .is_some_and(|byte| is_identifier_start_byte(*byte))
+    {
+        return None;
+    }
+
+    let mut cursor = name_start + 1;
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| is_identifier_byte(*byte))
+    {
+        cursor += 1;
+    }
+
+    cursor = skip_inline_whitespace(code, cursor);
+    if bytes.get(cursor) == Some(&b'<') {
+        cursor = skip_balanced_angle(code, cursor)?;
+        cursor = skip_inline_whitespace(code, cursor);
+    }
+
+    if bytes.get(cursor) != Some(&b'=') {
+        return None;
+    }
+
+    let mut index = start;
+    let mut depth = 0usize;
+    let mut saw_equals = false;
+    let mut replacement = String::new();
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'=' => saw_equals = true,
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => depth = depth.saturating_sub(1),
+            b'\n' => {
+                replacement.push('\n');
+                index += 1;
+                if !saw_equals || depth == 0 {
+                    break;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    Some((replacement, index))
+}
+
+fn strip_function_generics(prefix: &str) -> String {
+    let bytes = prefix.as_bytes();
+    let generic_end = skip_inline_whitespace_back(bytes, bytes.len());
+    if generic_end == 0 || bytes.get(generic_end - 1) != Some(&b'>') {
+        return prefix.to_owned();
+    }
+
+    let mut depth = 0usize;
+    let mut index = generic_end;
+    while index > 0 {
+        index -= 1;
+        match bytes[index] {
+            b'>' => depth += 1,
+            b'<' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let mut output = String::with_capacity(prefix.len());
+                    output.push_str(&prefix[..index]);
+                    output.push_str(&prefix[generic_end..]);
+                    return output;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    prefix.to_owned()
+}
+
+fn skip_balanced_angle(code: &str, start: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let mut depth = 0usize;
+    let mut index = start;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            b'\n' | b';' => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+
+    None
+}
+
+fn skip_type_annotation(code: &str, start: usize, terminators: &[u8]) -> usize {
+    let bytes = code.as_bytes();
+    let mut index = start;
+    let mut depth = 0usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if depth == 0
+            && terminators.contains(&byte)
+            && !(byte == b'-' && bytes.get(index + 1) == Some(&b'>'))
+        {
+            break;
+        }
+
+        match byte {
+            b'{' | b'(' | b'[' | b'<' => depth += 1,
+            b'}' | b')' | b']' | b'>' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    index
+}
+
+fn skip_function_return_annotation(code: &str, start: usize) -> usize {
+    let bytes = code.as_bytes();
+    let mut index = start;
+    let mut depth = 0usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if depth == 0 {
+            if matches!(byte, b'\n' | b';') {
+                break;
+            }
+            if matches!(byte, b' ' | b'\t' | b'\r') {
+                let after_whitespace = skip_inline_whitespace(code, index);
+                if is_function_body_keyword_at(code, after_whitespace) {
+                    break;
+                }
+            }
+        }
+
+        match byte {
+            b'{' | b'(' | b'[' | b'<' => depth += 1,
+            b'}' | b')' | b']' | b'>' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    index
+}
+
+fn long_bracket_open(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'[') {
+        return None;
+    }
+
+    let mut index = start + 1;
+    while bytes.get(index) == Some(&b'=') {
+        index += 1;
+    }
+
+    if bytes.get(index) == Some(&b'[') {
+        Some(index - start + 1)
+    } else {
+        None
+    }
+}
+
+fn find_long_bracket_end(bytes: &[u8], start: usize, equals: usize) -> Option<usize> {
+    let mut index = start;
+    while index < bytes.len() {
+        if bytes[index] == b']' {
+            let mut cursor = index + 1;
+            let mut seen_equals = 0usize;
+            while seen_equals < equals && bytes.get(cursor) == Some(&b'=') {
+                cursor += 1;
+                seen_equals += 1;
+            }
+            if seen_equals == equals && bytes.get(cursor) == Some(&b']') {
+                return Some(cursor + 1);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn find_quoted_string_end(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[index] == quote {
+            return index + 1;
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+fn find_line_end(bytes: &[u8], start: usize) -> usize {
+    bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| start + offset + 1)
+        .unwrap_or(bytes.len())
+}
+
+fn find_matching_paren(bytes: &[u8], open_paren: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, byte) in bytes.iter().enumerate().skip(open_paren) {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_keyword_at(code: &str, index: usize, keyword: &str) -> bool {
+    let bytes = code.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    if bytes.get(index..index + keyword_bytes.len()) != Some(keyword_bytes) {
+        return false;
+    }
+
+    let before_is_identifier = index
+        .checked_sub(1)
+        .and_then(|before| bytes.get(before))
+        .is_some_and(|byte| is_identifier_byte(*byte));
+    let after_is_identifier = bytes
+        .get(index + keyword_bytes.len())
+        .is_some_and(|byte| is_identifier_byte(*byte));
+
+    !before_is_identifier && !after_is_identifier
+}
+
+fn is_statement_start(code: &str, index: usize) -> bool {
+    for byte in code.as_bytes()[..index].iter().rev() {
+        match byte {
+            b' ' | b'\t' | b'\r' => {}
+            b'\n' | b';' => return true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn is_function_body_keyword_at(code: &str, index: usize) -> bool {
+    [
+        "break", "continue", "do", "for", "function", "if", "local", "repeat", "return", "while",
+    ]
+    .iter()
+    .any(|keyword| is_keyword_at(code, index, keyword))
+}
+
+fn skip_whitespace(code: &str, mut index: usize) -> usize {
+    while code
+        .as_bytes()
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        index += 1;
+    }
+    index
+}
+
+fn skip_inline_whitespace(code: &str, mut index: usize) -> usize {
+    while matches!(code.as_bytes().get(index), Some(b' ' | b'\t' | b'\r')) {
+        index += 1;
+    }
+    index
+}
+
+fn skip_inline_whitespace_back(bytes: &[u8], mut index: usize) -> usize {
+    while index > 0 && matches!(bytes.get(index - 1), Some(b' ' | b'\t' | b'\r')) {
+        index -= 1;
+    }
+    index
+}
+
+fn previous_non_whitespace_is_identifier(segment: &str, index: usize) -> bool {
+    segment.as_bytes()[..index]
+        .iter()
+        .rev()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| is_identifier_byte(*byte))
+}
+
+fn next_non_whitespace_starts_type(segment: &str, index: usize) -> bool {
+    segment.as_bytes()[index..]
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'{' | b'(' | b'['))
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_identifier_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn push_next_char(source: &str, output: &mut String, index: &mut usize) {
+    let ch = source[*index..]
+        .chars()
+        .next()
+        .expect("index must be at a character boundary");
+    output.push(ch);
+    *index += ch.len_utf8();
 }
 
 fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
@@ -1105,6 +1697,77 @@ mod tests {
                 OsString::from("input.luau"),
             ]
         );
+    }
+
+    #[test]
+    fn strip_luau_type_annotations_from_local_declarations() {
+        let source = "\
+local Bus:ObjectValue = script.Bus
+local speed: number, route: string = 4, 10
+";
+        let expected = "\
+local Bus = script.Bus
+local speed, route = 4, 10
+";
+
+        assert_eq!(strip_luau_type_annotations(source), expected);
+    }
+
+    #[test]
+    fn strip_luau_type_annotations_from_function_signatures() {
+        let source = "\
+local function getBus(bus: ObjectValue, route: string): boolean
+    return bus.Name == route
+end
+function Controller:Start(player: Player): () return self:Run(player) end
+local f: (number) -> string = function(value: number): string return tostring(value) end
+function id<T>(value: T): T return value end
+";
+        let expected = "\
+local function getBus(bus, route)
+    return bus.Name == route
+end
+function Controller:Start(player) return self:Run(player) end
+local f = function(value) return tostring(value) end
+function id(value) return value end
+";
+
+        assert_eq!(strip_luau_type_annotations(source), expected);
+    }
+
+    #[test]
+    fn strip_luau_type_aliases_and_casts_without_removing_type_calls() {
+        let source = "\
+type Bus = { name: string }
+export type Route<T> = { value: T }
+type(value)
+local bus = value :: Bus
+local callback = handler :: (number) -> string
+local runtime = type(value)
+";
+        let expected = concat!(
+            "\n",
+            "\n",
+            "type(value)\n",
+            "local bus = value \n",
+            "local callback = handler \n",
+            "local runtime = type(value)\n",
+        );
+
+        assert_eq!(strip_luau_type_annotations(source), expected);
+    }
+
+    #[test]
+    fn strip_luau_type_annotations_preserves_comments_strings_and_method_calls() {
+        let source = "\
+-- local Bus:ObjectValue = script.Bus
+local text = \"value: ObjectValue\"
+local template = `value: ObjectValue`
+local long = [[type Foo = string]]
+object:Method(script.Bus)
+";
+
+        assert_eq!(strip_luau_type_annotations(source), source);
     }
 
     #[test]

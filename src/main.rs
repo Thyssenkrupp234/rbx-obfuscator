@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// Strip Luau type annotations before every Prometheus run.
+    #[arg(long)]
+    strip_types: bool,
+
     /// Directory where original script sources should be written.
     #[arg(long)]
     backup_dir: Option<PathBuf>,
@@ -64,6 +68,7 @@ fn main() -> anyhow::Result<()> {
         output: cli.output,
         obfuscation_level: cli.level.into(),
         dry_run: cli.dry_run,
+        strip_types: cli.strip_types,
         backup_dir: cli.backup_dir,
         skip_paths: cli.skip_path,
         manifest: cli.manifest,
@@ -102,5 +107,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.output, Some(PathBuf::from("output.rbxl")));
+    }
+
+    #[test]
+    fn strip_types_flag_is_supported() {
+        let cli = Cli::try_parse_from([
+            "rbxl-obfuscate",
+            "input.rbxl",
+            "--level",
+            "minimal",
+            "--strip-types",
+        ])
+        .unwrap();
+
+        assert!(cli.strip_types);
     }
 }
