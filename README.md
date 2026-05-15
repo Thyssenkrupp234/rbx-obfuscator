@@ -74,6 +74,12 @@ Obfuscate a model file with an explicit output path:
 rbx-obfuscator input.rbxm --level high --output output.rbxm
 ```
 
+Update the CLI and managed dependencies:
+
+```bash
+rbx-obfuscator update
+```
+
 Options:
 
 - `--level <minimal|low|medium|high>`: required obfuscation complexity. Maps to a Prometheus preset.
@@ -83,6 +89,10 @@ Options:
 - `--backup-dir <dir>`: writes original script sources as `.luau` files before replacement.
 - `--skip-path <path>`: skips an exact normalized Roblox instance path, such as `game.ServerScriptService.Main`. Can be passed more than once.
 - `--manifest <path>`: writes a JSON report of processed, skipped, failed, or dry-run scripts, including whether type annotations were stripped.
+
+Commands:
+
+- `update`: downloads the latest installer from GitHub, updates the source checkout, rebuilds the CLI, reinstalls it, and updates Prometheus. Pass `--verbose` after `update` to show installer output.
 
 The tool accepts only `.rbxl` and `.rbxm` inputs and refuses to write the output path when it resolves to the same file as the input.
 
