@@ -363,15 +363,21 @@ fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<(
                 match key.code {
                     KeyCode::Enter => {
                         let _ = script_action_sender.send(LongScriptAction::Skip);
-                        progress_state.notice = "Skip requested for the current long-running script.".to_owned();
+                        progress_state.notice =
+                            "Skip requested for the current long-running script.".to_owned();
                     }
                     KeyCode::Char('m') | KeyCode::Char('M') => {
                         let _ = script_action_sender.send(LongScriptAction::SwitchToMinify);
-                        progress_state.notice = "Minify requested for the current long-running script.".to_owned();
+                        progress_state.notice =
+                            "Minify requested for the current long-running script.".to_owned();
                     }
-                    KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Char('s') | KeyCode::Char('S') => {
+                    KeyCode::Char('k')
+                    | KeyCode::Char('K')
+                    | KeyCode::Char('s')
+                    | KeyCode::Char('S') => {
                         let _ = script_action_sender.send(LongScriptAction::KeepWaiting);
-                        progress_state.notice = "Stay-current requested for this long-running script.".to_owned();
+                        progress_state.notice =
+                            "Stay-current requested for this long-running script.".to_owned();
                     }
                     _ => {}
                 }
@@ -453,7 +459,9 @@ impl WorkerLongScriptControl {
                 LongScriptPhase::AutoSwitchToMinify if self.stay_on_current_preset => {
                     Some(LongScriptAction::KeepWaiting)
                 }
-                LongScriptPhase::AutoSkip if self.stay_on_minify => Some(LongScriptAction::KeepWaiting),
+                LongScriptPhase::AutoSkip if self.stay_on_minify => {
+                    Some(LongScriptAction::KeepWaiting)
+                }
                 _ => None,
             },
         }
@@ -607,7 +615,9 @@ impl ProgressUiState {
                 self.long_script_can_minify = can_minify;
                 self.notice = message;
             }
-            ProgressEvent::LongScriptDecision { message, action, .. } => {
+            ProgressEvent::LongScriptDecision {
+                message, action, ..
+            } => {
                 self.notice = message;
                 if matches!(
                     action,

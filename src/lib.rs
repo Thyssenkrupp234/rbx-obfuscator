@@ -306,12 +306,7 @@ where
     C: FnMut() -> bool,
     F: FnMut(ProgressEvent),
 {
-    run_with_progress_controlled_and_script_actions(
-        options,
-        should_cancel,
-        |_| None,
-        progress,
-    )
+    run_with_progress_controlled_and_script_actions(options, should_cancel, |_| None, progress)
 }
 
 pub fn run_with_progress_controlled_and_script_actions<C, S, F>(
@@ -1070,6 +1065,7 @@ fn is_script_class(class_name: &str) -> bool {
     SCRIPT_CLASSES.contains(&class_name)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_prometheus_with_type_fallback<S, F>(
     prometheus_path: &Path,
     input_source: &str,
@@ -1140,7 +1136,11 @@ where
             false,
             progress,
             script_action,
-        ),
+        )
+        .map_err(|error| PrometheusFailure {
+            error,
+            luau_compatibility_applied: false,
+        }),
         Err(original_error) => {
             let prepared = prepare_luau_for_prometheus(input_source);
             if prepared == input_source {
@@ -1190,6 +1190,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_attempt_outcome<S, F>(
     outcome: PrometheusAttemptOutcome,
     prometheus_path: &Path,
@@ -1222,15 +1223,15 @@ where
             progress,
             script_action,
         )
-        .and_then(|minify_outcome| match minify_outcome {
-            PrometheusAttemptOutcome::Transformed(source) => Ok(ScriptTransformOutcome::Transformed {
+        .map(|minify_outcome| match minify_outcome {
+            PrometheusAttemptOutcome::Transformed(source) => ScriptTransformOutcome::Transformed {
                 source,
                 luau_compatibility_applied,
-            }),
-            PrometheusAttemptOutcome::Skip(reason) => Ok(ScriptTransformOutcome::Skipped { reason }),
-            PrometheusAttemptOutcome::SwitchToMinify => Ok(ScriptTransformOutcome::Skipped {
+            },
+            PrometheusAttemptOutcome::Skip(reason) => ScriptTransformOutcome::Skipped { reason },
+            PrometheusAttemptOutcome::SwitchToMinify => ScriptTransformOutcome::Skipped {
                 reason: "Minify was already active; script skipped to avoid hanging".to_owned(),
-            }),
+            },
         }),
     }
 }
@@ -1392,7 +1393,12 @@ where
                 preset: preset.to_owned(),
                 can_minify: allow_switch_to_minify,
                 phase,
-                message: long_script_prompt_message(script_path, preset, allow_switch_to_minify, phase),
+                message: long_script_prompt_message(
+                    script_path,
+                    preset,
+                    allow_switch_to_minify,
+                    phase,
+                ),
             });
         }
 
@@ -2970,14 +2976,10 @@ mod tests {
         );
     }
 
-
     #[test]
     fn prometheus_minify_command_args_use_minify_preset() {
-        let args = prometheus_args_for_preset(
-            "Minify",
-            Path::new("output.luau"),
-            Path::new("input.luau"),
-        );
+        let args =
+            prometheus_args_for_preset("Minify", Path::new("output.luau"), Path::new("input.luau"));
 
         assert_eq!(args[1], OsString::from("Minify"));
         assert!(args.contains(&OsString::from("--saveerrors")));
