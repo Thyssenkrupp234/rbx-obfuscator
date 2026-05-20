@@ -1,0 +1,1082 @@
+use std::{
+    io::{self, Stdout},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::{bail, Context, Result};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    Frame, Terminal,
+};
+
+use rbxl_obfuscate::{
+    default_output_path,
+    extract::{ExtractOptions, ExtractSummary},
+    ObfuscationLevel, ObfuscationSummary, Options, ProgressEvent,
+};
+
+const APP_TITLE: &str = "Roblox-Obfuscator v1.0";
+const LEVELS: [ObfuscationLevel; 4] = [
+    ObfuscationLevel::Minimal,
+    ObfuscationLevel::Low,
+    ObfuscationLevel::Medium,
+    ObfuscationLevel::High,
+];
+
+pub fn run_wizard() -> Result<()> {
+    let mut terminal = TerminalSession::enter()?;
+    let mut state = WizardState::default();
+
+    loop {
+        terminal.draw(|frame| render_home(frame, &state))?;
+        if event::poll(Duration::from_millis(100))? {
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match handle_home_key(&mut state, key.code)? {
+                WizardAction::Continue => {}
+                WizardAction::Quit => return Ok(()),
+                WizardAction::Run => break,
+            }
+        }
+    }
+
+    run_operation(&mut terminal, state)
+}
+
+struct TerminalSession {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl TerminalSession {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enable terminal raw mode")?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend).context("failed to initialize terminal UI")?;
+        terminal.clear().context("failed to clear terminal UI")?;
+        Ok(Self { terminal })
+    }
+
+    fn draw<F>(&mut self, draw: F) -> Result<()>
+    where
+        F: FnOnce(&mut Frame<'_>),
+    {
+        self.terminal.draw(draw)?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WizardMode {
+    Obfuscate,
+    Extract,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WizardStep {
+    Mode,
+    Input,
+    Output,
+    Level,
+    Run,
+}
+
+#[derive(Debug)]
+enum WizardAction {
+    Continue,
+    Run,
+    Quit,
+}
+
+#[derive(Debug)]
+struct WizardState {
+    mode: WizardMode,
+    step: WizardStep,
+    input: String,
+    output: String,
+    level_index: usize,
+    message: String,
+}
+
+impl Default for WizardState {
+    fn default() -> Self {
+        Self {
+            mode: WizardMode::Obfuscate,
+            step: WizardStep::Mode,
+            input: String::new(),
+            output: String::new(),
+            level_index: 3,
+            message: "Tip: drag or paste a file path into the terminal.".to_owned(),
+        }
+    }
+}
+
+impl WizardState {
+    fn selected_level(&self) -> ObfuscationLevel {
+        LEVELS[self.level_index]
+    }
+
+    fn is_input_valid(&self) -> bool {
+        let path = PathBuf::from(clean_path_input(&self.input));
+        path.is_file() && rbxl_obfuscate::validate_input_format(&path).is_ok()
+    }
+
+    fn is_output_valid(&self) -> bool {
+        let input = PathBuf::from(clean_path_input(&self.input));
+        let output = PathBuf::from(clean_path_input(&self.output));
+        if output.as_os_str().is_empty() {
+            return false;
+        }
+        match self.mode {
+            WizardMode::Obfuscate => {
+                rbxl_obfuscate::validate_input_format(&output).is_ok()
+                    && rbxl_obfuscate::validate_output_path(&input, &output).is_ok()
+            }
+            WizardMode::Extract => {
+                rbxl_obfuscate::extract::validate_extract_output(&input, &output).is_ok()
+            }
+        }
+    }
+}
+
+fn handle_home_key(state: &mut WizardState, code: KeyCode) -> Result<WizardAction> {
+    match code {
+        KeyCode::Char('q') => return Ok(WizardAction::Quit),
+        KeyCode::Esc => {
+            state.step = match state.step {
+                WizardStep::Mode => return Ok(WizardAction::Quit),
+                WizardStep::Input => WizardStep::Mode,
+                WizardStep::Output => WizardStep::Input,
+                WizardStep::Level => WizardStep::Output,
+                WizardStep::Run => {
+                    if state.mode == WizardMode::Obfuscate {
+                        WizardStep::Level
+                    } else {
+                        WizardStep::Output
+                    }
+                }
+            };
+        }
+        KeyCode::Up => match state.step {
+            WizardStep::Mode => state.mode = WizardMode::Obfuscate,
+            WizardStep::Level => state.level_index = state.level_index.saturating_sub(1),
+            _ => {}
+        },
+        KeyCode::Down => match state.step {
+            WizardStep::Mode => state.mode = WizardMode::Extract,
+            WizardStep::Level => state.level_index = (state.level_index + 1).min(LEVELS.len() - 1),
+            _ => {}
+        },
+        KeyCode::Left => match state.step {
+            WizardStep::Mode => state.mode = WizardMode::Obfuscate,
+            WizardStep::Level => state.level_index = state.level_index.saturating_sub(1),
+            _ => {}
+        },
+        KeyCode::Right => match state.step {
+            WizardStep::Mode => state.mode = WizardMode::Extract,
+            WizardStep::Level => state.level_index = (state.level_index + 1).min(LEVELS.len() - 1),
+            _ => {}
+        },
+        KeyCode::Enter => match state.step {
+            WizardStep::Mode => state.step = WizardStep::Input,
+            WizardStep::Input => {
+                if state.is_input_valid() {
+                    if state.output.trim().is_empty() && state.mode == WizardMode::Obfuscate {
+                        let input = PathBuf::from(clean_path_input(&state.input));
+                        if let Ok(default_output) =
+                            default_output_path(&input, state.selected_level())
+                        {
+                            state.output = default_output.display().to_string();
+                        }
+                    }
+                    state.step = WizardStep::Output;
+                    state.message = "Input file looks good.".to_owned();
+                } else {
+                    state.message =
+                        "Input must be an existing .rbxl, .rbxm, .rbxlx, or .rbxmx file."
+                            .to_owned();
+                }
+            }
+            WizardStep::Output => {
+                if state.is_output_valid() {
+                    state.step = if state.mode == WizardMode::Obfuscate {
+                        WizardStep::Level
+                    } else {
+                        WizardStep::Run
+                    };
+                    state.message = "Output path looks good.".to_owned();
+                } else {
+                    state.message =
+                        "Output path is invalid or points at the same file as the input."
+                            .to_owned();
+                }
+            }
+            WizardStep::Level => state.step = WizardStep::Run,
+            WizardStep::Run => return Ok(WizardAction::Run),
+        },
+        KeyCode::Backspace => match state.step {
+            WizardStep::Input => {
+                state.input.pop();
+            }
+            WizardStep::Output => {
+                state.output.pop();
+            }
+            _ => {}
+        },
+        KeyCode::Char(ch) => match state.step {
+            WizardStep::Input => state.input.push(ch),
+            WizardStep::Output => state.output.push(ch),
+            _ => {}
+        },
+        _ => {}
+    }
+
+    Ok(WizardAction::Continue)
+}
+
+fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<()> {
+    let input = PathBuf::from(clean_path_input(&state.input));
+    let output = PathBuf::from(clean_path_input(&state.output));
+    let started_at = Instant::now();
+    let mut progress_state = ProgressUiState::new(state.mode);
+    let (sender, receiver) = mpsc::channel();
+    let cancel_requested = Arc::new(AtomicBool::new(false));
+
+    match state.mode {
+        WizardMode::Obfuscate => {
+            let level = state.selected_level();
+            let worker_cancel = Arc::clone(&cancel_requested);
+            thread::spawn(move || {
+                let result = rbxl_obfuscate::run_with_progress_controlled(
+                    Options {
+                        input,
+                        output: Some(output),
+                        obfuscation_level: level,
+                        dry_run: false,
+                        strip_types: false,
+                        verbose: false,
+                        backup_dir: None,
+                        skip_paths: Vec::new(),
+                        manifest: None,
+                    },
+                    || worker_cancel.load(Ordering::SeqCst),
+                    |event| {
+                        let _ = sender.send(WorkerMessage::Progress(event));
+                    },
+                )
+                .map(WizardResult::Obfuscation)
+                .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(WorkerMessage::Finished(result));
+            });
+        }
+        WizardMode::Extract => {
+            let worker_cancel = Arc::clone(&cancel_requested);
+            thread::spawn(move || {
+                let result = rbxl_obfuscate::extract::run_with_progress_controlled(
+                    ExtractOptions {
+                        input,
+                        output_folder: output,
+                        verbose: false,
+                    },
+                    || worker_cancel.load(Ordering::SeqCst),
+                    |event| {
+                        let _ = sender.send(WorkerMessage::Progress(event));
+                    },
+                )
+                .map(WizardResult::Extraction)
+                .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(WorkerMessage::Finished(result));
+            });
+        }
+    }
+
+    let result = 'progress: loop {
+        while let Ok(message) = receiver.try_recv() {
+            match message {
+                WorkerMessage::Progress(event) => progress_state.apply(event),
+                WorkerMessage::Finished(result) => break 'progress result,
+            }
+        }
+        terminal.draw(|frame| render_progress(frame, &progress_state))?;
+        if event::poll(Duration::from_millis(100))? {
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind == KeyEventKind::Press
+                && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+            {
+                cancel_requested.store(true, Ordering::SeqCst);
+                progress_state.notice =
+                    "Cancel requested; waiting for the current operation to stop cleanly."
+                        .to_owned();
+            }
+        }
+    };
+
+    let completion = CompletionState::from_result(result, started_at.elapsed())?;
+    loop {
+        terminal.draw(|frame| render_complete(frame, &completion))?;
+        if event::poll(Duration::from_millis(100))? {
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('c') => {}
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WorkerMessage {
+    Progress(ProgressEvent),
+    Finished(std::result::Result<WizardResult, String>),
+}
+
+#[derive(Debug)]
+enum WizardResult {
+    Obfuscation(ObfuscationSummary),
+    Extraction(ExtractSummary),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StageStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl StageStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in progress",
+            Self::Completed => "completed",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Pending => Color::Gray,
+            Self::InProgress => Color::Yellow,
+            Self::Completed => Color::Green,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProgressUiState {
+    mode: WizardMode,
+    subtitle: &'static str,
+    stages: Vec<(String, StageStatus)>,
+    current_stage: usize,
+    current_name: String,
+    current_thing: String,
+    compatibility: String,
+    scripts_completed: usize,
+    scripts_total: usize,
+    eta: Option<u64>,
+    notice: String,
+}
+
+impl ProgressUiState {
+    fn new(mode: WizardMode) -> Self {
+        let (subtitle, stages) = match mode {
+            WizardMode::Obfuscate => (
+                "Full obfuscation in progress",
+                vec![
+                    (
+                        "Extract scripts from RBXL/RBXM".to_owned(),
+                        StageStatus::Pending,
+                    ),
+                    ("Obfuscate with Prometheus".to_owned(), StageStatus::Pending),
+                    ("Compile output file".to_owned(), StageStatus::Pending),
+                ],
+            ),
+            WizardMode::Extract => (
+                "Extract components in progress",
+                vec![
+                    ("Parse RBXL/RBXM".to_owned(), StageStatus::Pending),
+                    ("Export components".to_owned(), StageStatus::Pending),
+                    ("Write manifest".to_owned(), StageStatus::Pending),
+                ],
+            ),
+        };
+
+        Self {
+            mode,
+            subtitle,
+            stages,
+            current_stage: 1,
+            current_name: String::new(),
+            current_thing: "Preparing".to_owned(),
+            compatibility: "Not attempted".to_owned(),
+            scripts_completed: 0,
+            scripts_total: 0,
+            eta: None,
+            notice: String::new(),
+        }
+    }
+
+    fn apply(&mut self, event: ProgressEvent) {
+        match event {
+            ProgressEvent::StageStarted {
+                stage_index, name, ..
+            } => {
+                self.current_stage = stage_index;
+                self.current_name = name.clone();
+                if let Some((_, status)) = self.stages.get_mut(stage_index.saturating_sub(1)) {
+                    *status = StageStatus::InProgress;
+                }
+            }
+            ProgressEvent::StageCompleted { stage_index, .. } => {
+                if let Some((_, status)) = self.stages.get_mut(stage_index.saturating_sub(1)) {
+                    *status = StageStatus::Completed;
+                }
+            }
+            ProgressEvent::CurrentItem { value, .. } => self.current_thing = value,
+            ProgressEvent::ScriptProgress {
+                completed,
+                total,
+                current_path,
+            } => {
+                self.scripts_completed = completed;
+                self.scripts_total = total;
+                if let Some(path) = current_path {
+                    self.current_thing = path;
+                }
+            }
+            ProgressEvent::CompatibilityNote { message } => self.compatibility = message,
+            ProgressEvent::EtaUpdated { seconds_remaining } => self.eta = seconds_remaining,
+            ProgressEvent::Warning { message } => self.notice = message,
+            ProgressEvent::Finished => {}
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompletionState {
+    mode: String,
+    input: String,
+    output_label: String,
+    output: String,
+    level: Option<String>,
+    scripts_label: String,
+    scripts_line: Option<String>,
+    guis_line: Option<String>,
+    content_refs_line: Option<String>,
+    duration: Duration,
+    backup: Option<String>,
+    command: String,
+}
+
+impl CompletionState {
+    fn from_result(
+        result: std::result::Result<WizardResult, String>,
+        duration: Duration,
+    ) -> Result<Self> {
+        match result {
+            Ok(WizardResult::Obfuscation(summary)) => Ok(Self {
+                mode: "Full Obfuscation".to_owned(),
+                input: display_path(&summary.input),
+                output_label: "Output".to_owned(),
+                output: display_path(&summary.output),
+                level: Some(summary.prometheus_preset.to_owned()),
+                scripts_label: "Scripts obfuscated".to_owned(),
+                scripts_line: Some(format!(
+                    "{} / {}",
+                    summary.scripts_processed, summary.scripts_found
+                )),
+                guis_line: None,
+                content_refs_line: None,
+                duration,
+                backup: Some(if summary.backup_created {
+                    "Created".to_owned()
+                } else {
+                    "Not requested".to_owned()
+                }),
+                command: format!(
+                    "rbx-obfuscator \\\n  \"{}\" \\\n  \"{}\" \\\n  --level {}",
+                    display_path(&summary.input),
+                    display_path(&summary.output),
+                    summary.obfuscation_level.as_str()
+                ),
+            }),
+            Ok(WizardResult::Extraction(summary)) => Ok(Self {
+                mode: "Extract Components".to_owned(),
+                input: display_path(&summary.input),
+                output_label: "Output folder".to_owned(),
+                output: display_path(&summary.output_folder),
+                level: None,
+                scripts_label: "Scripts exported".to_owned(),
+                scripts_line: Some(format!(
+                    "{} / {}",
+                    summary.scripts_exported, summary.scripts_found
+                )),
+                guis_line: Some(summary.guis_exported.to_string()),
+                content_refs_line: Some(summary.content_refs_found.to_string()),
+                duration,
+                backup: None,
+                command: format!(
+                    "rbx-obfuscator extract \\\n  \"{}\" \\\n  \"{}\"",
+                    display_path(&summary.input),
+                    display_path(&summary.output_folder)
+                ),
+            }),
+            Err(error) => bail!(error),
+        }
+    }
+}
+
+fn render_home(frame: &mut Frame<'_>, state: &WizardState) {
+    let area = frame.area();
+    render_background(frame, area);
+    let chunks = centered_chunks(area);
+    render_header(frame, chunks[0], "Interactive setup wizard");
+
+    let body_lines = vec![
+        Line::from("Choose what you want to do:"),
+        Line::from(""),
+        option_line(
+            state.mode == WizardMode::Obfuscate,
+            "Full Obfuscation (recommended)",
+        ),
+        option_line(
+            state.mode == WizardMode::Extract,
+            "Extract RBXL/RBXM Components Only",
+        ),
+        Line::from(""),
+    ];
+    frame.render_widget(Paragraph::new(body_lines).style(text_style()), chunks[1]);
+
+    let steps = step_lines(state);
+    frame.render_widget(
+        Paragraph::new(steps)
+            .block(border_block())
+            .style(text_style())
+            .wrap(Wrap { trim: false }),
+        chunks[2],
+    );
+
+    render_footer(
+        frame,
+        chunks[3],
+        &[
+            state.message.as_str(),
+            "Enter = continue    ↑/↓ = move    ←/→ = change option    q = quit",
+            "Direct argument mode still works.",
+        ],
+    );
+}
+
+fn render_progress(frame: &mut Frame<'_>, state: &ProgressUiState) {
+    let area = frame.area();
+    render_background(frame, area);
+    let chunks = centered_chunks(area);
+    render_header(frame, chunks[0], state.subtitle);
+
+    let stage_header = Line::from(vec![
+        Span::styled(
+            format!("Stage {}/{} ", state.current_stage, state.stages.len()),
+            blue_bold(),
+        ),
+        Span::styled("— ", neutral_style()),
+        Span::styled(state.current_name.clone(), text_style()),
+    ]);
+    frame.render_widget(Paragraph::new(stage_header), chunks[1]);
+
+    let stage_lines: Vec<Line<'_>> = state
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(index, (name, status))| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{}/{} ", index + 1, state.stages.len()),
+                    blue_bold(),
+                ),
+                Span::styled(name.clone(), blue_style()),
+                Span::raw(" ".repeat(2)),
+                Span::styled(status.label(), Style::default().fg(status.color())),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(stage_lines)
+            .block(border_block())
+            .style(text_style()),
+        chunks[2],
+    );
+
+    let eta = state
+        .eta
+        .map(format_seconds)
+        .unwrap_or_else(|| "calculating...".to_owned());
+    let script_label = if state.mode == WizardMode::Extract {
+        "Scripts exported: "
+    } else {
+        "Scripts obfuscated: "
+    };
+    let total = state.scripts_total.max(1);
+    let progress = state.scripts_completed.min(total);
+    let details = vec![
+        Line::from(vec![
+            Span::styled("Current thing: ", neutral_style()),
+            Span::styled(state.current_thing.clone(), green_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("Compatibility: ", neutral_style()),
+            Span::styled(state.compatibility.clone(), yellow_style()),
+        ]),
+        Line::from(vec![
+            Span::styled(script_label, neutral_style()),
+            Span::styled(
+                format!("{} / {}", state.scripts_completed, state.scripts_total),
+                green_style(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Estimated time remaining: ", neutral_style()),
+            Span::styled(eta, green_style()),
+        ]),
+        Line::from(""),
+        progress_line("Overall progress", progress, total),
+        progress_line("Stage progress", progress, total),
+    ];
+    frame.render_widget(
+        Paragraph::new(details)
+            .block(border_block())
+            .style(text_style())
+            .wrap(Wrap { trim: false }),
+        chunks[3],
+    );
+
+    let earlier_later = vec![
+        Line::from(vec![
+            Span::styled("Earlier: ", neutral_style()),
+            Span::styled(
+                state
+                    .stages
+                    .first()
+                    .map(|stage| stage.0.as_str())
+                    .unwrap_or(""),
+                blue_style(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Later:   ", neutral_style()),
+            Span::styled(
+                state
+                    .stages
+                    .last()
+                    .map(|stage| stage.0.as_str())
+                    .unwrap_or(""),
+                blue_style(),
+            ),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(earlier_later).block(border_block()),
+        chunks[4],
+    );
+
+    let notice = if state.notice.is_empty() {
+        "Press q to cancel    Logs: hidden    Mode: interactive"
+    } else {
+        state.notice.as_str()
+    };
+    render_footer(frame, chunks[5], &[notice]);
+}
+
+fn render_complete(frame: &mut Frame<'_>, state: &CompletionState) {
+    let area = frame.area();
+    render_background(frame, area);
+    let chunks = centered_chunks(area);
+    render_header(frame, chunks[0], "Operation complete");
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled("[✓] Done", green_style())])),
+        chunks[1],
+    );
+
+    let mut summary = vec![
+        summary_line("Mode", &state.mode, false),
+        summary_line("Input", &state.input, true),
+        summary_line(&state.output_label, &state.output, true),
+    ];
+    if let Some(level) = &state.level {
+        summary.push(summary_line("Prometheus level", level, false));
+    }
+    if let Some(scripts) = &state.scripts_line {
+        summary.push(summary_line(&state.scripts_label, scripts, false));
+    }
+    if let Some(guis) = &state.guis_line {
+        summary.push(summary_line("GUIs exported", guis, false));
+    }
+    if let Some(content_refs) = &state.content_refs_line {
+        summary.push(summary_line("Content refs found", content_refs, false));
+    }
+    summary.push(summary_line(
+        "Duration",
+        &format_seconds(state.duration.as_secs()),
+        false,
+    ));
+    if let Some(backup) = &state.backup {
+        summary.push(summary_line("Backup", backup, false));
+    }
+    frame.render_widget(Paragraph::new(summary).block(border_block()), chunks[2]);
+
+    let command_lines = state
+        .command
+        .lines()
+        .map(|line| Line::from(Span::styled(line.to_owned(), green_style())))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(command_lines).block(border_block().title(" Equivalent direct command ")),
+        chunks[3],
+    );
+
+    render_footer(
+        frame,
+        chunks[4],
+        &[
+            "Enter = exit    c = copy command unavailable    q = quit",
+            "The direct command is shown above.",
+        ],
+    );
+}
+
+fn centered_chunks(area: Rect) -> Vec<Rect> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(5),
+            Constraint::Min(3),
+        ])
+        .margin(2)
+        .split(area)
+        .to_vec()
+}
+
+fn render_background(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+}
+
+fn render_header(frame: &mut Frame<'_>, area: Rect, subtitle: &str) {
+    let lines = vec![
+        Line::from(Span::styled(APP_TITLE, blue_bold())).centered(),
+        Line::from(Span::styled(subtitle, neutral_style())).centered(),
+    ];
+    frame.render_widget(Paragraph::new(lines).block(border_block()), area);
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, lines: &[&str]) {
+    let lines = lines
+        .iter()
+        .map(|line| Line::from(Span::styled(*line, neutral_style())))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(border_style()),
+        ),
+        area,
+    );
+}
+
+fn step_lines(state: &WizardState) -> Vec<Line<'_>> {
+    let input_valid = state.is_input_valid();
+    let output_valid = state.is_output_valid();
+    let output_label = if state.mode == WizardMode::Obfuscate {
+        "Output file"
+    } else {
+        "Output folder"
+    };
+    vec![
+        step_title(
+            1,
+            "Input file",
+            input_valid,
+            state.step == WizardStep::Input,
+        ),
+        step_value(&state.input),
+        step_title(
+            2,
+            output_label,
+            output_valid,
+            state.step == WizardStep::Output,
+        ),
+        step_value(&state.output),
+        step_title(
+            3,
+            "Prometheus level",
+            state.mode == WizardMode::Extract,
+            state.step == WizardStep::Level,
+        ),
+        level_line(state),
+        step_title(4, "Run", false, state.step == WizardStep::Run),
+    ]
+}
+
+fn step_title(index: usize, title: &str, checked: bool, active: bool) -> Line<'_> {
+    let marker = if checked { " ✓" } else { "" };
+    let style = if active { yellow_style() } else { blue_bold() };
+    Line::from(vec![
+        Span::styled(format!("{index}. "), style),
+        Span::styled(format!("{title}{marker}"), style),
+    ])
+}
+
+fn step_value(value: &str) -> Line<'_> {
+    let value = if value.trim().is_empty() {
+        "  <paste path here>"
+    } else {
+        value
+    };
+    Line::from(Span::styled(format!("  {value}"), green_style()))
+}
+
+fn level_line(state: &WizardState) -> Line<'_> {
+    if state.mode == WizardMode::Extract {
+        return Line::from(Span::styled("  not needed for extraction", neutral_style()));
+    }
+
+    let labels = ["Weak", "Low", "Medium", "Strong"];
+    let spans = labels
+        .iter()
+        .enumerate()
+        .flat_map(|(index, label)| {
+            let text = if index == state.level_index {
+                format!("[{label}]")
+            } else {
+                (*label).to_owned()
+            };
+            [
+                Span::styled(
+                    text,
+                    if index == state.level_index {
+                        yellow_style()
+                    } else {
+                        neutral_style()
+                    },
+                ),
+                Span::raw("   "),
+            ]
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
+fn option_line(selected: bool, text: &str) -> Line<'_> {
+    Line::from(vec![
+        Span::styled(if selected { ">  " } else { "   " }, text_style()),
+        Span::styled(
+            text.to_owned(),
+            if selected {
+                yellow_style()
+            } else {
+                text_style()
+            },
+        ),
+    ])
+}
+
+fn progress_line(label: &str, completed: usize, total: usize) -> Line<'_> {
+    let width = 36usize;
+    let filled = completed
+        .saturating_mul(width)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(width);
+    let percent = completed
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0);
+    Line::from(vec![
+        Span::styled(format!("{label}: "), neutral_style()),
+        Span::styled("[", neutral_style()),
+        Span::styled("█".repeat(filled), green_style()),
+        Span::styled("·".repeat(width - filled), neutral_style()),
+        Span::styled("] ", neutral_style()),
+        Span::styled(format!("{percent}% ({completed} / {total})"), green_style()),
+    ])
+}
+
+fn summary_line(label: &str, value: &str, path_value: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), blue_bold()),
+        Span::styled(
+            value.to_owned(),
+            if path_value {
+                green_style()
+            } else {
+                text_style()
+            },
+        ),
+    ])
+}
+
+fn border_block() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style())
+        .style(Style::default().bg(Color::Black))
+}
+
+fn blue_bold() -> Style {
+    blue_style().add_modifier(Modifier::BOLD)
+}
+
+fn blue_style() -> Style {
+    Style::default().fg(Color::Blue).bg(Color::Black)
+}
+
+fn green_style() -> Style {
+    Style::default().fg(Color::Green).bg(Color::Black)
+}
+
+fn yellow_style() -> Style {
+    Style::default().fg(Color::Yellow).bg(Color::Black)
+}
+
+fn neutral_style() -> Style {
+    Style::default().fg(Color::Gray).bg(Color::Black)
+}
+
+fn text_style() -> Style {
+    Style::default().fg(Color::White).bg(Color::Black)
+}
+
+fn border_style() -> Style {
+    Style::default().fg(Color::Gray).bg(Color::Black)
+}
+
+fn clean_path_input(value: &str) -> String {
+    let trimmed = value.trim().trim_matches('"').trim_matches('\'');
+    trimmed.replace("\\ ", " ")
+}
+
+fn display_path(path: &std::path::Path) -> String {
+    let path = path.display().to_string();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Ok(stripped) = PathBuf::from(&path).strip_prefix(&home) {
+            return format!("~/{}", stripped.display());
+        }
+    }
+    path
+}
+
+fn format_seconds(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    format!("{minutes:02}:{seconds:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn home_screen_renders_without_panicking() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = WizardState::default();
+
+        terminal.draw(|frame| render_home(frame, &state)).unwrap();
+    }
+
+    #[test]
+    fn progress_screen_renders_without_panicking() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = ProgressUiState::new(WizardMode::Obfuscate);
+        state.apply(ProgressEvent::StageStarted {
+            stage_index: 2,
+            stage_total: 3,
+            name: "Obfuscate with Prometheus".to_owned(),
+        });
+        state.apply(ProgressEvent::ScriptProgress {
+            completed: 49,
+            total: 300,
+            current_path: Some("VehicleController.client.luau".to_owned()),
+        });
+
+        terminal
+            .draw(|frame| render_progress(frame, &state))
+            .unwrap();
+    }
+
+    #[test]
+    fn complete_screen_renders_without_panicking() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = CompletionState {
+            mode: "Full Obfuscation".to_owned(),
+            input: "~/Documents/Ro-TransLink.rbxl".to_owned(),
+            output_label: "Output".to_owned(),
+            output: "~/Documents/Ro-TransLink-obfuscated.rbxl".to_owned(),
+            level: Some("Strong".to_owned()),
+            scripts_label: "Scripts obfuscated".to_owned(),
+            scripts_line: Some("300 / 300".to_owned()),
+            guis_line: None,
+            content_refs_line: None,
+            duration: Duration::from_secs(462),
+            backup: Some("Created".to_owned()),
+            command: "rbx-obfuscator \\\n  \"input.rbxl\" \\\n  \"output.rbxl\" \\\n  --level high"
+                .to_owned(),
+        };
+
+        terminal
+            .draw(|frame| render_complete(frame, &state))
+            .unwrap();
+    }
+
+    #[test]
+    fn eta_format_handles_zero_seconds() {
+        assert_eq!(format_seconds(0), "00:00");
+        assert_eq!(format_seconds(137), "02:17");
+    }
+}

@@ -4,7 +4,10 @@ use std::{
     process::{Command, Stdio},
 };
 
+use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
+
+mod tui;
 
 const INSTALL_SCRIPT_URL: &str =
     "https://raw.githubusercontent.com/Thyssenkrupp234/roblox-obfuscator/main/install.sh";
@@ -30,14 +33,18 @@ impl From<CliObfuscationLevel> for rbxl_obfuscate::ObfuscationLevel {
 
 #[derive(Debug, Parser)]
 #[command(
+    name = "rbx-obfuscator",
     author,
     version,
     about = "Obfuscate Roblox RBXL/RBXM script sources with Prometheus",
-    after_help = "Commands:\n  update    Update rbx-obfuscator and managed dependencies"
+    after_help = "Commands:\n  rbx-obfuscator                         Open the interactive wizard\n  rbx-obfuscator obfuscate <in> <out>    Explicit obfuscation mode\n  rbx-obfuscator extract <in> <folder>   Extract scripts, GUI JSON, instances, and content refs\n  rbx-obfuscator update                  Update the CLI and managed dependencies"
 )]
-struct Cli {
-    /// Input .rbxl or .rbxm file.
+struct ObfuscateCli {
+    /// Input .rbxl, .rbxm, .rbxlx, or .rbxmx file.
     input: PathBuf,
+
+    /// Optional positional output file for compatibility with older usage.
+    output_positional: Option<PathBuf>,
 
     /// Output file. Defaults to <input-stem>-obfuscated_<Level>.<extension>.
     #[arg(short, long)]
@@ -66,6 +73,27 @@ struct Cli {
     /// Path to write a JSON processing manifest.
     #[arg(long)]
     manifest: Option<PathBuf>,
+
+    /// Show detailed script and Prometheus logs.
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "rbx-obfuscator extract",
+    about = "Extract RBXL/RBXM components without obfuscating"
+)]
+struct ExtractCli {
+    /// Input .rbxl, .rbxm, .rbxlx, or .rbxmx file.
+    input: PathBuf,
+
+    /// Output folder for extracted components.
+    output_folder: PathBuf,
+
+    /// Show detailed extraction logs.
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -79,41 +107,87 @@ struct UpdateCli {
     verbose: bool,
 }
 
-fn main() -> anyhow::Result<()> {
-    if let Some(update_cli) = parse_update_command(std::env::args_os()) {
-        return run_update(update_cli);
-    }
-
-    let cli = Cli::parse();
-
-    rbxl_obfuscate::run(rbxl_obfuscate::Options {
-        input: cli.input,
-        output: cli.output,
-        obfuscation_level: cli.level.into(),
-        dry_run: cli.dry_run,
-        strip_types: cli.strip_types,
-        backup_dir: cli.backup_dir,
-        skip_paths: cli.skip_path,
-        manifest: cli.manifest,
-    })
+#[derive(Debug)]
+enum AppMode {
+    Wizard,
+    Obfuscate(ObfuscateCli),
+    Extract(ExtractCli),
+    Update(UpdateCli),
 }
 
-fn parse_update_command<I>(args: I) -> Option<UpdateCli>
+fn main() -> Result<()> {
+    let mode = match parse_app_mode(std::env::args_os()) {
+        Ok(mode) => mode,
+        Err(error) => error.exit(),
+    };
+
+    match mode {
+        AppMode::Wizard => tui::run_wizard(),
+        AppMode::Obfuscate(cli) => rbxl_obfuscate::run(cli.into_options()?),
+        AppMode::Extract(cli) => {
+            rbxl_obfuscate::extract::run(rbxl_obfuscate::extract::ExtractOptions {
+                input: cli.input,
+                output_folder: cli.output_folder,
+                verbose: cli.verbose,
+            })
+            .map(|_| ())
+        }
+        AppMode::Update(update_cli) => run_update(update_cli),
+    }
+}
+
+fn parse_app_mode<I>(args: I) -> std::result::Result<AppMode, clap::Error>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut args = args.into_iter();
-    args.next()?;
-    let first_arg = args.next()?;
-    if first_arg != "update" {
-        return None;
+    let args: Vec<OsString> = args.into_iter().collect();
+    if args.len() == 1 {
+        return Ok(AppMode::Wizard);
     }
 
-    let update_args = std::iter::once(OsString::from("rbx-obfuscator update")).chain(args);
-    Some(UpdateCli::parse_from(update_args))
+    let first_arg = args.get(1).and_then(|arg| arg.to_str()).unwrap_or_default();
+
+    match first_arg {
+        "update" => {
+            let update_args = std::iter::once(OsString::from("rbx-obfuscator update"))
+                .chain(args.into_iter().skip(2));
+            UpdateCli::try_parse_from(update_args).map(AppMode::Update)
+        }
+        "extract" => {
+            let extract_args = std::iter::once(OsString::from("rbx-obfuscator extract"))
+                .chain(args.into_iter().skip(2));
+            ExtractCli::try_parse_from(extract_args).map(AppMode::Extract)
+        }
+        "obfuscate" => {
+            let obfuscate_args = std::iter::once(OsString::from("rbx-obfuscator obfuscate"))
+                .chain(args.into_iter().skip(2));
+            ObfuscateCli::try_parse_from(obfuscate_args).map(AppMode::Obfuscate)
+        }
+        _ => ObfuscateCli::try_parse_from(args).map(AppMode::Obfuscate),
+    }
 }
 
-fn run_update(update_cli: UpdateCli) -> anyhow::Result<()> {
+impl ObfuscateCli {
+    fn into_options(self) -> Result<rbxl_obfuscate::Options> {
+        if self.output_positional.is_some() && self.output.is_some() {
+            bail!("provide either positional output or --output, not both");
+        }
+
+        Ok(rbxl_obfuscate::Options {
+            input: self.input,
+            output: self.output.or(self.output_positional),
+            obfuscation_level: self.level.into(),
+            dry_run: self.dry_run,
+            strip_types: self.strip_types,
+            verbose: self.verbose,
+            backup_dir: self.backup_dir,
+            skip_paths: self.skip_path,
+            manifest: self.manifest,
+        })
+    }
+}
+
+fn run_update(update_cli: UpdateCli) -> Result<()> {
     let mut installer = Command::new("sh");
     installer.arg("-c");
     if update_cli.verbose {
@@ -141,70 +215,147 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_args_selects_wizard() {
+        assert!(matches!(
+            parse_app_mode(["rbx-obfuscator"].map(OsString::from)).unwrap(),
+            AppMode::Wizard
+        ));
+    }
+
+    #[test]
     fn level_is_required() {
-        assert!(Cli::try_parse_from(["rbx-obfuscator", "input.rbxl"]).is_err());
+        assert!(parse_app_mode(["rbx-obfuscator", "input.rbxl"].map(OsString::from)).is_err());
     }
 
     #[test]
     fn output_is_optional() {
-        let cli =
-            Cli::try_parse_from(["rbx-obfuscator", "input.rbxm", "--level", "medium"]).unwrap();
+        let AppMode::Obfuscate(cli) = parse_app_mode(
+            ["rbx-obfuscator", "input.rbxm", "--level", "medium"].map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected obfuscation mode");
+        };
 
         assert_eq!(cli.input, PathBuf::from("input.rbxm"));
         assert_eq!(cli.level, CliObfuscationLevel::Medium);
         assert_eq!(cli.output, None);
+        assert_eq!(cli.output_positional, None);
     }
 
     #[test]
     fn output_flag_is_supported() {
-        let cli = Cli::try_parse_from([
-            "rbx-obfuscator",
-            "input.rbxl",
-            "--level",
-            "high",
-            "--output",
-            "output.rbxl",
-        ])
-        .unwrap();
+        let AppMode::Obfuscate(cli) = parse_app_mode(
+            [
+                "rbx-obfuscator",
+                "input.rbxl",
+                "--level",
+                "high",
+                "--output",
+                "output.rbxl",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected obfuscation mode");
+        };
 
         assert_eq!(cli.output, Some(PathBuf::from("output.rbxl")));
     }
 
     #[test]
-    fn strip_types_flag_is_supported() {
-        let cli = Cli::try_parse_from([
-            "rbx-obfuscator",
-            "input.rbxl",
-            "--level",
-            "minimal",
-            "--strip-types",
-        ])
-        .unwrap();
+    fn positional_output_is_supported() {
+        let AppMode::Obfuscate(cli) = parse_app_mode(
+            [
+                "rbx-obfuscator",
+                "input.rbxl",
+                "output.rbxl",
+                "--level",
+                "high",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected obfuscation mode");
+        };
+
+        assert_eq!(cli.output_positional, Some(PathBuf::from("output.rbxl")));
+    }
+
+    #[test]
+    fn explicit_obfuscate_subcommand_is_supported() {
+        let AppMode::Obfuscate(cli) = parse_app_mode(
+            [
+                "rbx-obfuscator",
+                "obfuscate",
+                "input.rbxl",
+                "output.rbxl",
+                "--level",
+                "minimal",
+                "--dry-run",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected obfuscation mode");
+        };
+
+        assert_eq!(cli.output_positional, Some(PathBuf::from("output.rbxl")));
+        assert!(cli.dry_run);
+    }
+
+    #[test]
+    fn extract_command_is_supported() {
+        let AppMode::Extract(cli) = parse_app_mode(
+            ["rbx-obfuscator", "extract", "input.rbxl", "output-folder"].map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected extract mode");
+        };
+
+        assert_eq!(cli.input, PathBuf::from("input.rbxl"));
+        assert_eq!(cli.output_folder, PathBuf::from("output-folder"));
+    }
+
+    #[test]
+    fn strip_types_and_verbose_flags_are_supported() {
+        let AppMode::Obfuscate(cli) = parse_app_mode(
+            [
+                "rbx-obfuscator",
+                "input.rbxl",
+                "--level",
+                "minimal",
+                "--strip-types",
+                "--verbose",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected obfuscation mode");
+        };
 
         assert!(cli.strip_types);
+        assert!(cli.verbose);
     }
 
     #[test]
     fn update_command_is_detected() {
-        let cli = parse_update_command(["rbx-obfuscator", "update"].map(OsString::from)).unwrap();
+        let AppMode::Update(cli) =
+            parse_app_mode(["rbx-obfuscator", "update"].map(OsString::from)).unwrap()
+        else {
+            panic!("expected update mode");
+        };
 
         assert!(!cli.verbose);
     }
 
     #[test]
     fn update_command_accepts_verbose() {
-        let cli =
-            parse_update_command(["rbx-obfuscator", "update", "--verbose"].map(OsString::from))
-                .unwrap();
+        let AppMode::Update(cli) =
+            parse_app_mode(["rbx-obfuscator", "update", "--verbose"].map(OsString::from)).unwrap()
+        else {
+            panic!("expected update mode");
+        };
 
         assert!(cli.verbose);
-    }
-
-    #[test]
-    fn non_update_command_uses_obfuscation_cli() {
-        assert!(parse_update_command(
-            ["rbx-obfuscator", "input.rbxl", "--level", "minimal"].map(OsString::from)
-        )
-        .is_none());
     }
 }

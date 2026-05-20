@@ -1,5 +1,4 @@
 /target/
 /.tools/
 AGENTS.md
-Cargo.lock
 .DS_Store

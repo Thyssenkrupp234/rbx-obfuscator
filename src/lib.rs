@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env,
     ffi::OsString,
     fs::{self, File},
@@ -7,7 +7,7 @@ use std::{
     io::{BufReader, BufWriter},
     path::{Component, Path, PathBuf},
     process::{Command, Output},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -18,7 +18,9 @@ use rbx_dom_weak::{
 use serde::Serialize;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
-const SCRIPT_CLASSES: &[&str] = &["Script", "LocalScript", "ModuleScript"];
+pub mod extract;
+
+pub(crate) const SCRIPT_CLASSES: &[&str] = &["Script", "LocalScript", "ModuleScript"];
 const PROMETHEUS_COMMAND: &str = "prometheus-lua";
 const PROMETHEUS_INSTALL_URL: &str =
     "https://raw.githubusercontent.com/prometheus-lua/Prometheus/master/install.sh";
@@ -40,7 +42,7 @@ pub enum ObfuscationLevel {
 }
 
 impl ObfuscationLevel {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Minimal => "minimal",
             Self::Low => "low",
@@ -49,7 +51,7 @@ impl ObfuscationLevel {
         }
     }
 
-    fn as_label(self) -> &'static str {
+    pub fn as_label(self) -> &'static str {
         match self {
             Self::Minimal => "Minimal",
             Self::Low => "Low",
@@ -64,10 +66,12 @@ impl ObfuscationLevel {
 pub enum RobloxFileFormat {
     Rbxl,
     Rbxm,
+    Rbxlx,
+    Rbxmx,
 }
 
 impl RobloxFileFormat {
-    fn from_path(path: &Path) -> Result<Self> {
+    pub fn from_path(path: &Path) -> Result<Self> {
         match path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -76,18 +80,26 @@ impl RobloxFileFormat {
         {
             Some("rbxl") => Ok(Self::Rbxl),
             Some("rbxm") => Ok(Self::Rbxm),
+            Some("rbxlx") => Ok(Self::Rbxlx),
+            Some("rbxmx") => Ok(Self::Rbxmx),
             _ => bail!(
-                "unsupported input file extension for {}: expected .rbxl or .rbxm",
+                "unsupported input file extension for {}: expected .rbxl, .rbxm, .rbxlx, or .rbxmx",
                 path.display()
             ),
         }
     }
 
-    fn as_name(self) -> &'static str {
+    pub fn as_name(self) -> &'static str {
         match self {
             Self::Rbxl => "RBXL",
             Self::Rbxm => "RBXM",
+            Self::Rbxlx => "RBXLX",
+            Self::Rbxmx => "RBXMX",
         }
+    }
+
+    fn is_xml(self) -> bool {
+        matches!(self, Self::Rbxlx | Self::Rbxmx)
     }
 }
 
@@ -107,9 +119,58 @@ pub struct Options {
     pub obfuscation_level: ObfuscationLevel,
     pub dry_run: bool,
     pub strip_types: bool,
+    pub verbose: bool,
     pub backup_dir: Option<PathBuf>,
     pub skip_paths: Vec<String>,
     pub manifest: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgressEvent {
+    StageStarted {
+        stage_index: usize,
+        stage_total: usize,
+        name: String,
+    },
+    StageCompleted {
+        stage_index: usize,
+        stage_total: usize,
+        name: String,
+    },
+    CurrentItem {
+        label: String,
+        value: String,
+    },
+    ScriptProgress {
+        completed: usize,
+        total: usize,
+        current_path: Option<String>,
+    },
+    CompatibilityNote {
+        message: String,
+    },
+    EtaUpdated {
+        seconds_remaining: Option<u64>,
+    },
+    Warning {
+        message: String,
+    },
+    Finished,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObfuscationSummary {
+    pub input: PathBuf,
+    pub output: PathBuf,
+    pub obfuscation_level: ObfuscationLevel,
+    pub prometheus_preset: &'static str,
+    pub scripts_found: usize,
+    pub scripts_processed: usize,
+    pub scripts_skipped: usize,
+    pub scripts_failed: usize,
+    pub dry_run: bool,
+    pub backup_created: bool,
+    pub duration: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -169,47 +230,82 @@ struct PrometheusFailure {
 }
 
 pub fn run(options: Options) -> Result<()> {
+    let verbose = options.verbose;
+    run_with_progress(options, |event| render_console_progress(event, verbose)).map(|_| ())
+}
+
+pub fn run_with_progress<F>(options: Options, progress: F) -> Result<ObfuscationSummary>
+where
+    F: FnMut(ProgressEvent),
+{
+    run_with_progress_controlled(options, || false, progress)
+}
+
+pub fn run_with_progress_controlled<C, F>(
+    options: Options,
+    mut should_cancel: C,
+    mut progress: F,
+) -> Result<ObfuscationSummary>
+where
+    C: FnMut() -> bool,
+    F: FnMut(ProgressEvent),
+{
+    let started_at = Instant::now();
     let input_format = validate_input_format(&options.input)?;
     let output = match &options.output {
         Some(output) => output.clone(),
         None => default_output_path(&options.input, options.obfuscation_level)?,
     };
+    let output_format = validate_input_format(&output)?;
     validate_options(&options, &output)?;
     let prometheus_path = resolve_or_install_prometheus(options.dry_run)?;
     let prometheus_preset = prometheus_preset_for_level(options.obfuscation_level);
 
-    if options.dry_run {
+    progress(ProgressEvent::StageStarted {
+        stage_index: 1,
+        stage_total: 3,
+        name: "Extract scripts from RBXL/RBXM".to_owned(),
+    });
+    progress(ProgressEvent::CurrentItem {
+        label: "Parsing input file".to_owned(),
+        value: options.input.display().to_string(),
+    });
+    if options.verbose {
+        if options.dry_run {
+            eprintln!(
+                "Using Prometheus preset {prometheus_preset} for --level {} (dry run; Prometheus executable is not launched)",
+                options.obfuscation_level.as_str()
+            );
+        } else {
+            eprintln!("Using Prometheus executable: {}", prometheus_path.display());
+            eprintln!(
+                "Using Prometheus preset {prometheus_preset} for --level {}",
+                options.obfuscation_level.as_str()
+            );
+        }
         eprintln!(
-            "Using Prometheus preset {prometheus_preset} for --level {} (dry run; Prometheus executable is not launched)",
-            options.obfuscation_level.as_str()
-        );
-    } else {
-        eprintln!("Using Prometheus executable: {}", prometheus_path.display());
-        eprintln!(
-            "Using Prometheus preset {prometheus_preset} for --level {}",
-            options.obfuscation_level.as_str()
+            "Loading {}: {}",
+            input_format.as_name(),
+            options.input.display()
         );
     }
-
-    eprintln!(
-        "Loading {}: {}",
-        input_format.as_name(),
-        options.input.display()
-    );
-    let input = BufReader::new(
-        File::open(&options.input)
-            .with_context(|| format!("failed to open input file {}", options.input.display()))?,
-    );
-    let mut dom = rbx_binary::from_reader(input).with_context(|| {
-        format!(
-            "failed to read Roblox binary file {}",
-            options.input.display()
-        )
-    })?;
+    let mut dom = read_roblox_file(&options.input, input_format)?;
 
     let skip_paths: HashSet<String> = options.skip_paths.iter().cloned().collect();
     let scripts = collect_scripts(&dom)?;
-    eprintln!("Found {} script instance(s)", scripts.len());
+    if options.verbose {
+        eprintln!("Found {} script instance(s)", scripts.len());
+    }
+    progress(ProgressEvent::ScriptProgress {
+        completed: 0,
+        total: scripts.len(),
+        current_path: None,
+    });
+    progress(ProgressEvent::StageCompleted {
+        stage_index: 1,
+        stage_total: 3,
+        name: "Extract scripts from RBXL/RBXM".to_owned(),
+    });
 
     let mut manifest_entries = Vec::with_capacity(scripts.len());
     let mut processed = 0usize;
@@ -229,10 +325,26 @@ pub fn run(options: Options) -> Result<()> {
         }
     }
 
+    progress(ProgressEvent::StageStarted {
+        stage_index: 2,
+        stage_total: 3,
+        name: "Obfuscate with Prometheus".to_owned(),
+    });
+    let mut eta = EtaTracker::default();
+    let total_scripts = scripts.len();
     for script in scripts {
+        if should_cancel() {
+            bail!("operation cancelled");
+        }
+        progress(ProgressEvent::CurrentItem {
+            label: "Current thing".to_owned(),
+            value: script.path.clone(),
+        });
         if skip_paths.contains(&script.path) {
             skipped += 1;
-            eprintln!("Skipping {} ({})", script.path, script.class_name);
+            if options.verbose {
+                eprintln!("Skipping {} ({})", script.path, script.class_name);
+            }
             manifest_entries.push(ManifestEntry {
                 path: script.path,
                 class_name: script.class_name,
@@ -243,15 +355,23 @@ pub fn run(options: Options) -> Result<()> {
                 backup_path: None,
                 error: None,
             });
+            progress(ProgressEvent::ScriptProgress {
+                completed: processed + skipped,
+                total: total_scripts,
+                current_path: None,
+            });
             continue;
         }
 
         if options.dry_run {
             processed += 1;
-            eprintln!(
-                "Would process {} ({}) with Prometheus preset {prometheus_preset}",
-                script.path, script.class_name
-            );
+            let progress_path = script.path.clone();
+            if options.verbose {
+                eprintln!(
+                    "Would process {} ({}) with Prometheus preset {prometheus_preset}",
+                    script.path, script.class_name
+                );
+            }
             manifest_entries.push(ManifestEntry {
                 path: script.path,
                 class_name: script.class_name,
@@ -261,6 +381,11 @@ pub fn run(options: Options) -> Result<()> {
                 luau_compatibility_applied: options.strip_types,
                 backup_path: None,
                 error: None,
+            });
+            progress(ProgressEvent::ScriptProgress {
+                completed: processed + skipped,
+                total: total_scripts,
+                current_path: Some(progress_path),
             });
             continue;
         }
@@ -274,7 +399,9 @@ pub fn run(options: Options) -> Result<()> {
             None
         };
 
-        eprintln!("Processing {} ({})", script.path, script.class_name);
+        if options.verbose {
+            eprintln!("Processing {} ({})", script.path, script.class_name);
+        }
         let temp_dir = prometheus_temp_dir
             .as_ref()
             .expect("Prometheus temp dir must exist outside dry-run")
@@ -286,15 +413,25 @@ pub fn run(options: Options) -> Result<()> {
             temp_dir,
             options.strip_types,
             &script.path,
+            options.verbose,
         ) {
             Ok(result) => result,
             Err(failure) => {
                 let error = format!("{:#}", failure.error);
                 let summary = first_error_line(&error).to_owned();
-                eprintln!(
-                    "Failed {}; leaving source unobfuscated: {}",
-                    script.path, summary
-                );
+                let progress_path = script.path.clone();
+                progress(ProgressEvent::Warning {
+                    message: format!(
+                        "Failed {}; leaving source unobfuscated: {summary}",
+                        script.path
+                    ),
+                });
+                if options.verbose {
+                    eprintln!(
+                        "Failed {}; leaving source unobfuscated: {}",
+                        script.path, summary
+                    );
+                }
                 failed_scripts.push(FailedScript {
                     path: script.path.clone(),
                     class_name: script.class_name.clone(),
@@ -310,6 +447,11 @@ pub fn run(options: Options) -> Result<()> {
                     backup_path,
                     error: Some(error),
                 });
+                progress(ProgressEvent::ScriptProgress {
+                    completed: processed + skipped + failed_scripts.len(),
+                    total: total_scripts,
+                    current_path: Some(progress_path),
+                });
                 continue;
             }
         };
@@ -322,6 +464,7 @@ pub fn run(options: Options) -> Result<()> {
             .insert(ustr("Source"), Variant::String(transformed.clone()));
 
         processed += 1;
+        let progress_path = script.path.clone();
         manifest_entries.push(ManifestEntry {
             path: script.path,
             class_name: script.class_name,
@@ -332,7 +475,26 @@ pub fn run(options: Options) -> Result<()> {
             backup_path,
             error: None,
         });
+        if luau_compatibility_applied {
+            progress(ProgressEvent::CompatibilityNote {
+                message: "Luau compatibility preprocessing applied".to_owned(),
+            });
+        }
+        eta.record_script();
+        progress(ProgressEvent::EtaUpdated {
+            seconds_remaining: eta.seconds_remaining(processed, total_scripts),
+        });
+        progress(ProgressEvent::ScriptProgress {
+            completed: processed + skipped + failed_scripts.len(),
+            total: total_scripts,
+            current_path: Some(progress_path),
+        });
     }
+    progress(ProgressEvent::StageCompleted {
+        stage_index: 2,
+        stage_total: 3,
+        name: "Obfuscate with Prometheus".to_owned(),
+    });
 
     if let Some(manifest_path) = &options.manifest {
         let manifest = Manifest {
@@ -347,37 +509,150 @@ pub fn run(options: Options) -> Result<()> {
             scripts: manifest_entries,
         };
         write_manifest(manifest_path, &manifest)?;
-        eprintln!("Wrote manifest: {}", manifest_path.display());
+        if options.verbose {
+            eprintln!("Wrote manifest: {}", manifest_path.display());
+        }
     }
 
-    eprintln!(
-        "Processed: {processed}, skipped: {skipped}, failed: {}",
-        failed_scripts.len()
-    );
+    progress(ProgressEvent::CurrentItem {
+        label: "Summary".to_owned(),
+        value: format!(
+            "Processed: {processed}, skipped: {skipped}, failed: {}",
+            failed_scripts.len()
+        ),
+    });
 
     if !failed_scripts.is_empty() {
-        eprintln!("Failed scripts left unobfuscated:");
+        progress(ProgressEvent::Warning {
+            message: format!("{} script(s) were left unobfuscated", failed_scripts.len()),
+        });
+        if options.verbose {
+            eprintln!("Failed scripts left unobfuscated:");
+        }
         for failed in &failed_scripts {
-            eprintln!(
-                "  - {} ({}): {}",
-                failed.path, failed.class_name, failed.error
-            );
+            if options.verbose {
+                eprintln!(
+                    "  - {} ({}): {}",
+                    failed.path, failed.class_name, failed.error
+                );
+            }
         }
     }
 
     if options.dry_run {
-        eprintln!("Dry run complete; no Roblox binary output written");
-        return Ok(());
+        progress(ProgressEvent::Finished);
+        return Ok(ObfuscationSummary {
+            input: options.input,
+            output,
+            obfuscation_level: options.obfuscation_level,
+            prometheus_preset,
+            scripts_found: total_scripts,
+            scripts_processed: processed,
+            scripts_skipped: skipped,
+            scripts_failed: failed_scripts.len(),
+            dry_run: true,
+            backup_created: options.backup_dir.is_some(),
+            duration: started_at.elapsed(),
+        });
     }
 
-    write_roblox_binary(&output, &dom, input_format)?;
+    progress(ProgressEvent::StageStarted {
+        stage_index: 3,
+        stage_total: 3,
+        name: "Compile output file".to_owned(),
+    });
+    if should_cancel() {
+        bail!("operation cancelled");
+    }
+    progress(ProgressEvent::CurrentItem {
+        label: "Writing output file".to_owned(),
+        value: output.display().to_string(),
+    });
+    write_roblox_file(&output, &dom, output_format)?;
+    progress(ProgressEvent::StageCompleted {
+        stage_index: 3,
+        stage_total: 3,
+        name: "Compile output file".to_owned(),
+    });
 
-    eprintln!("Done");
-    Ok(())
+    progress(ProgressEvent::Finished);
+    Ok(ObfuscationSummary {
+        input: options.input,
+        output,
+        obfuscation_level: options.obfuscation_level,
+        prometheus_preset,
+        scripts_found: total_scripts,
+        scripts_processed: processed,
+        scripts_skipped: skipped,
+        scripts_failed: failed_scripts.len(),
+        dry_run: false,
+        backup_created: options.backup_dir.is_some(),
+        duration: started_at.elapsed(),
+    })
 }
 
-fn validate_input_format(input: &Path) -> Result<RobloxFileFormat> {
+pub fn validate_input_format(input: &Path) -> Result<RobloxFileFormat> {
     RobloxFileFormat::from_path(input)
+}
+
+fn render_console_progress(event: ProgressEvent, verbose: bool) {
+    match event {
+        ProgressEvent::StageStarted {
+            stage_index,
+            stage_total,
+            name,
+        } => {
+            eprintln!("Stage {stage_index}/{stage_total}: {name}");
+        }
+        ProgressEvent::ScriptProgress {
+            completed, total, ..
+        } => {
+            if verbose && total > 0 {
+                eprintln!("Scripts: {completed}/{total}");
+            }
+        }
+        ProgressEvent::Warning { message } => eprintln!("warning: {message}"),
+        ProgressEvent::Finished => eprintln!("Done"),
+        ProgressEvent::CurrentItem { label, value } if verbose => eprintln!("{label}: {value}"),
+        ProgressEvent::CompatibilityNote { message } if verbose => eprintln!("{message}"),
+        ProgressEvent::EtaUpdated { .. }
+        | ProgressEvent::StageCompleted { .. }
+        | ProgressEvent::CurrentItem { .. }
+        | ProgressEvent::CompatibilityNote { .. } => {}
+    }
+}
+
+#[derive(Default)]
+struct EtaTracker {
+    samples: VecDeque<Duration>,
+    last_tick: Option<Instant>,
+}
+
+impl EtaTracker {
+    fn record_script(&mut self) {
+        let now = Instant::now();
+        if let Some(last_tick) = self.last_tick {
+            self.samples
+                .push_back(now.saturating_duration_since(last_tick));
+            if self.samples.len() > 10 {
+                self.samples.pop_front();
+            }
+        }
+        self.last_tick = Some(now);
+    }
+
+    fn seconds_remaining(&self, completed: usize, total: usize) -> Option<u64> {
+        if completed >= total || self.samples.len() < 3 {
+            return None;
+        }
+        let remaining = total.saturating_sub(completed);
+        if remaining == 0 {
+            return Some(0);
+        }
+        let total_sample_seconds = self.samples.iter().map(Duration::as_secs_f64).sum::<f64>();
+        let average = total_sample_seconds / self.samples.len() as f64;
+        Some((average * remaining as f64).round() as u64)
+    }
 }
 
 fn validate_options(options: &Options, output: &Path) -> Result<()> {
@@ -387,13 +662,18 @@ fn validate_options(options: &Options, output: &Path) -> Result<()> {
     if !options.input.is_file() {
         bail!("input path is not a file: {}", options.input.display());
     }
-    if same_path(&options.input, output)? {
+    validate_output_path(&options.input, output)?;
+    Ok(())
+}
+
+pub fn validate_output_path(input: &Path, output: &Path) -> Result<()> {
+    if same_path(input, output)? {
         bail!("output must not overwrite input: {}", output.display());
     }
     Ok(())
 }
 
-fn default_output_path(input: &Path, level: ObfuscationLevel) -> Result<PathBuf> {
+pub fn default_output_path(input: &Path, level: ObfuscationLevel) -> Result<PathBuf> {
     let stem = input
         .file_stem()
         .ok_or_else(|| anyhow!("input path has no file name: {}", input.display()))?;
@@ -424,7 +704,7 @@ impl PrometheusRuntime for SystemPrometheusRuntime {
             Ok(output) => bail!(
                 "{PROMETHEUS_COMMAND} --help exited with status {}. {}",
                 output.status,
-                command_output_summary(&output)
+                command_output_summary(&output, false)
             ),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => {
@@ -444,7 +724,7 @@ impl PrometheusRuntime for SystemPrometheusRuntime {
             bail!(
                 "Prometheus installer exited with status {}. {}",
                 output.status,
-                command_output_summary(&output)
+                command_output_summary(&output, false)
             );
         }
 
@@ -461,7 +741,7 @@ impl PrometheusRuntime for SystemPrometheusRuntime {
             bail!(
                 "{PROMETHEUS_COMMAND} update exited with status {}. {}",
                 output.status,
-                command_output_summary(&output)
+                command_output_summary(&output, false)
             );
         }
 
@@ -695,10 +975,11 @@ fn run_prometheus_with_type_fallback(
     temp_dir: &Path,
     strip_types: bool,
     script_path: &str,
+    verbose: bool,
 ) -> std::result::Result<(String, bool), PrometheusFailure> {
     if strip_types {
         let prepared = prepare_luau_for_prometheus(input_source);
-        return run_prometheus(prometheus_path, &prepared, level, temp_dir)
+        return run_prometheus(prometheus_path, &prepared, level, temp_dir, verbose)
             .map(|transformed| (transformed, true))
             .map_err(|error| PrometheusFailure {
                 error,
@@ -706,7 +987,7 @@ fn run_prometheus_with_type_fallback(
             });
     }
 
-    match run_prometheus(prometheus_path, input_source, level, temp_dir) {
+    match run_prometheus(prometheus_path, input_source, level, temp_dir, verbose) {
         Ok(transformed) => Ok((transformed, false)),
         Err(original_error) => {
             let prepared = prepare_luau_for_prometheus(input_source);
@@ -717,11 +998,13 @@ fn run_prometheus_with_type_fallback(
                 });
             }
 
-            eprintln!(
-                "Prometheus failed for {}; retrying after applying Luau compatibility preprocessing",
-                script_path
-            );
-            run_prometheus(prometheus_path, &prepared, level, temp_dir)
+            if verbose {
+                eprintln!(
+                    "Prometheus failed for {}; retrying after applying Luau compatibility preprocessing",
+                    script_path
+                );
+            }
+            run_prometheus(prometheus_path, &prepared, level, temp_dir, verbose)
                 .map(|transformed| (transformed, true))
                 .map_err(|fallback_error| PrometheusFailure {
                     error: anyhow!(
@@ -738,6 +1021,7 @@ fn run_prometheus(
     input_source: &str,
     level: ObfuscationLevel,
     temp_dir: &Path,
+    verbose: bool,
 ) -> Result<String> {
     let input_file = TempFileBuilder::new()
         .prefix("rbx-obfuscator-input-")
@@ -784,7 +1068,7 @@ fn run_prometheus(
             "Prometheus exited with status {} using preset {}. {}",
             status_output.status,
             prometheus_preset_for_level(level),
-            command_output_summary(&status_output)
+            command_output_summary(&status_output, verbose)
         );
     }
 
@@ -826,10 +1110,30 @@ fn prometheus_args_for(
     ]
 }
 
-fn command_output_summary(output: &Output) -> String {
+fn command_output_summary(output: &Output, verbose: bool) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    format!("stdout: {} stderr: {}", stdout.trim(), stderr.trim())
+    if verbose {
+        return format!("stdout: {} stderr: {}", stdout.trim(), stderr.trim());
+    }
+
+    format!(
+        "stdout: {} stderr: {}",
+        compact_process_output(&stdout),
+        compact_process_output(&stderr)
+    )
+}
+
+fn compact_process_output(output: &str) -> String {
+    const LIMIT: usize = 800;
+    let trimmed = output.trim();
+    if trimmed.chars().count() <= LIMIT {
+        return trimmed.to_owned();
+    }
+
+    let mut compact: String = trimmed.chars().take(LIMIT).collect();
+    compact.push_str(" ...");
+    compact
 }
 
 fn first_error_line(error: &str) -> &str {
@@ -1761,8 +2065,26 @@ fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
     fs::write(path, json).with_context(|| format!("failed to write manifest {}", path.display()))
 }
 
-fn write_roblox_binary(path: &Path, dom: &WeakDom, input_format: RobloxFileFormat) -> Result<()> {
-    eprintln!("Writing {}: {}", input_format.as_name(), path.display());
+pub(crate) fn read_roblox_file(path: &Path, format: RobloxFileFormat) -> Result<WeakDom> {
+    let input = BufReader::new(
+        File::open(path)
+            .with_context(|| format!("failed to open input file {}", path.display()))?,
+    );
+
+    if format.is_xml() {
+        rbx_xml::from_reader_default(input)
+            .with_context(|| format!("failed to read Roblox XML file {}", path.display()))
+    } else {
+        rbx_binary::from_reader(input)
+            .with_context(|| format!("failed to read Roblox binary file {}", path.display()))
+    }
+}
+
+pub(crate) fn write_roblox_file(
+    path: &Path,
+    dom: &WeakDom,
+    format: RobloxFileFormat,
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1775,12 +2097,21 @@ fn write_roblox_binary(path: &Path, dom: &WeakDom, input_format: RobloxFileForma
     {
         let output = BufWriter::new(&mut temp);
         let top_level_refs = dom.root().children().to_vec();
-        rbx_binary::to_writer(output, dom, &top_level_refs).with_context(|| {
-            format!(
-                "failed to write temporary Roblox binary for {}",
-                path.display()
-            )
-        })?;
+        if format.is_xml() {
+            rbx_xml::to_writer_default(output, dom, &top_level_refs).with_context(|| {
+                format!(
+                    "failed to write temporary Roblox XML for {}",
+                    path.display()
+                )
+            })?;
+        } else {
+            rbx_binary::to_writer(output, dom, &top_level_refs).with_context(|| {
+                format!(
+                    "failed to write temporary Roblox binary for {}",
+                    path.display()
+                )
+            })?;
+        }
     }
     temp.persist(path)
         .map_err(|error| error.error)
@@ -1793,7 +2124,7 @@ fn write_roblox_binary(path: &Path, dom: &WeakDom, input_format: RobloxFileForma
     Ok(())
 }
 
-fn same_path(input: &Path, output: &Path) -> Result<bool> {
+pub(crate) fn same_path(input: &Path, output: &Path) -> Result<bool> {
     let input = input
         .canonicalize()
         .with_context(|| format!("failed to canonicalize input {}", input.display()))?;
@@ -1833,7 +2164,7 @@ fn absolute_lexical(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn child_path(parent_path: &str, child_name: &str) -> String {
+pub(crate) fn child_path(parent_path: &str, child_name: &str) -> String {
     format!("{parent_path}.{}", escape_path_segment(child_name))
 }
 
@@ -1856,7 +2187,7 @@ fn stable_hash(value: &str) -> u64 {
     hash
 }
 
-fn sanitize_filename(value: &str) -> String {
+pub(crate) fn sanitize_filename(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
@@ -1865,11 +2196,47 @@ fn sanitize_filename(value: &str) -> String {
             output.push('_');
         }
     }
+    let output = output.trim_matches('.').to_owned();
     if output.is_empty() {
         "script".to_owned()
+    } else if is_windows_reserved_filename(&output) {
+        format!("{output}_")
     } else {
         output
     }
+}
+
+fn is_windows_reserved_filename(value: &str) -> bool {
+    let name = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    matches!(
+        name.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 #[cfg(test)]
@@ -2014,7 +2381,7 @@ mod tests {
     }
 
     #[test]
-    fn rbxl_and_rbxm_extensions_are_supported() {
+    fn roblox_file_extensions_are_supported() {
         assert_eq!(
             validate_input_format(Path::new("place.rbxl")).unwrap(),
             RobloxFileFormat::Rbxl
@@ -2023,12 +2390,70 @@ mod tests {
             validate_input_format(Path::new("model.RBXM")).unwrap(),
             RobloxFileFormat::Rbxm
         );
+        assert_eq!(
+            validate_input_format(Path::new("place.rbxlx")).unwrap(),
+            RobloxFileFormat::Rbxlx
+        );
+        assert_eq!(
+            validate_input_format(Path::new("model.RBXMX")).unwrap(),
+            RobloxFileFormat::Rbxmx
+        );
     }
 
     #[test]
     fn unknown_input_extension_is_rejected() {
-        let error = validate_input_format(Path::new("model.rbxmx")).unwrap_err();
-        assert!(format!("{error:#}").contains("expected .rbxl or .rbxm"));
+        let error = validate_input_format(Path::new("model.txt")).unwrap_err();
+        assert!(format!("{error:#}").contains(".rbxl, .rbxm, .rbxlx, or .rbxmx"));
+    }
+
+    #[test]
+    fn obfuscation_progress_sequence_includes_core_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.rbxl");
+        let output = dir.path().join("output.rbxl");
+        let dom = WeakDom::new(
+            rbx_dom_weak::InstanceBuilder::new("DataModel").with_child(
+                rbx_dom_weak::InstanceBuilder::new("Script")
+                    .with_name("Main")
+                    .with_property("Source", "print('hi')"),
+            ),
+        );
+        write_roblox_file(&input, &dom, RobloxFileFormat::Rbxl).unwrap();
+        let mut events = Vec::new();
+
+        let summary = run_with_progress(
+            Options {
+                input,
+                output: Some(output),
+                obfuscation_level: ObfuscationLevel::Minimal,
+                dry_run: true,
+                strip_types: false,
+                verbose: false,
+                backup_dir: None,
+                skip_paths: Vec::new(),
+                manifest: None,
+            },
+            |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(summary.scripts_found, 1);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::StageStarted { stage_index: 1, .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::StageStarted { stage_index: 2, .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::Finished)));
+    }
+
+    #[test]
+    fn eta_calculation_handles_zero_scripts() {
+        let eta = EtaTracker::default();
+
+        assert_eq!(eta.seconds_remaining(0, 0), None);
     }
 
     #[test]

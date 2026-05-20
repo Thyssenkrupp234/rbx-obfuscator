@@ -1,6 +1,6 @@
 # rbx-obfuscator
 
-`rbx-obfuscator` is a Roblox binary release tool for place and model files. It reads `.rbxl` place files and `.rbxm` model files, finds every `Script`, `LocalScript`, and `ModuleScript`, runs each Luau `Source` property through Prometheus, replaces the source in the DOM, and writes a new Roblox binary file.
+`rbx-obfuscator` is a Roblox place/model utility for obfuscation and component extraction. It reads `.rbxl`, `.rbxm`, `.rbxlx`, and `.rbxmx` files, finds every `Script`, `LocalScript`, and `ModuleScript`, can run Luau `Source` properties through Prometheus, and writes the result back in the same Roblox file format.
 
 It does not use Rojo and does not require Roblox Studio for the normal workflow.
 
@@ -56,6 +56,14 @@ Dry-run mode does not install, update, or launch Prometheus.
 
 ## Usage
 
+Run with no arguments to open the interactive terminal wizard:
+
+```bash
+rbx-obfuscator
+```
+
+The wizard lets you choose full obfuscation or component extraction, paste paths, pick the Prometheus level, watch clean progress, and see the equivalent direct command on the completion screen.
+
 Obfuscate a place file and write the default output next to the input:
 
 ```bash
@@ -74,27 +82,70 @@ Obfuscate a model file with an explicit output path:
 rbx-obfuscator input.rbxm --level high --output output.rbxm
 ```
 
+The compatibility positional output form is also supported:
+
+```bash
+rbx-obfuscator input.rbxl output.rbxl --level high
+```
+
+You can use the explicit subcommand form if you prefer:
+
+```bash
+rbx-obfuscator obfuscate input.rbxl output.rbxl --level high
+```
+
+Extract components without obfuscating:
+
+```bash
+rbx-obfuscator extract Ro-TransLink.rbxl ./Ro-TransLink-extracted
+```
+
 Update the CLI and managed dependencies:
 
 ```bash
 rbx-obfuscator update
 ```
 
-Options:
+Obfuscation options:
 
 - `--level <minimal|low|medium|high>`: required obfuscation complexity. Maps to a Prometheus preset.
-- `--output <path>`, `-o <path>`: output `.rbxl` or `.rbxm` path. Defaults to `<input-stem>-obfuscated_<Level>.<extension>`.
+- `--output <path>`, `-o <path>`: output `.rbxl`, `.rbxm`, `.rbxlx`, or `.rbxmx` path. Defaults to `<input-stem>-obfuscated_<Level>.<extension>`.
 - `--dry-run`: reports scripts that would be processed and the Prometheus preset that would be used, without running Prometheus or writing output.
 - `--strip-types`: removes Luau type annotations and lowers known Prometheus-incompatible Luau syntax before every Prometheus run.
 - `--backup-dir <dir>`: writes original script sources as `.luau` files before replacement.
 - `--skip-path <path>`: skips an exact normalized Roblox instance path, such as `game.ServerScriptService.Main`. Can be passed more than once.
 - `--manifest <path>`: writes a JSON report of processed, skipped, failed, or dry-run scripts, including whether Luau compatibility preprocessing was applied.
+- `--verbose`, `-v`: shows detailed per-script and Prometheus logs. Normal output stays compact.
 
 Commands:
 
+- `extract <input> <output-folder>`: exports scripts, GUI JSON, the instance tree, content references, and `manifest.json`.
 - `update`: downloads the latest installer from GitHub, updates the source checkout, rebuilds the CLI, reinstalls it, and updates Prometheus. Pass `--verbose` after `update` to show installer output.
 
-The tool accepts only `.rbxl` and `.rbxm` inputs and refuses to write the output path when it resolves to the same file as the input.
+The tool accepts `.rbxl`, `.rbxm`, `.rbxlx`, and `.rbxmx` inputs. It refuses to write the obfuscation output path when it resolves to the same file as the input, and extraction refuses to use the input file as the output folder.
+
+## Extraction
+
+`rbx-obfuscator extract` deconstructs a Roblox place/model file into a readable project breakdown:
+
+```text
+Ro-TransLink-extracted/
+  scripts/
+  guis/
+  instances.json
+  content_refs.json
+  manifest.json
+```
+
+Extraction exports:
+
+- script sources that exist in the file as `.luau`
+- GUI roots such as `ScreenGui`, `BillboardGui`, and `SurfaceGui` as JSON
+- a readable `instances.json` hierarchy with safe serializable properties
+- asset/content references such as `rbxassetid://`, `rbxasset://`, Roblox asset URLs, texture IDs, mesh IDs, sound IDs, and animation IDs
+- a manifest with counts, warnings, unsupported property notes, and exported script metadata
+
+Extraction does not decompile bytecode, recover source that is not stored in the file, download external assets, or claim raw assets were recovered. It lists references that are available in serializable properties.
 
 Prometheus can fail on some Luau type syntax, such as `local Bus:ObjectValue = script.Bus` or `for _, Car: Model in pairs(cars) do`, and on some newer Luau syntax, such as if-expressions and backtick string interpolation. By default, the tool only applies this Luau compatibility preprocessing after Prometheus fails for a script, then retries that one script once. Use `--strip-types` to preprocess every script before Prometheus runs.
 
