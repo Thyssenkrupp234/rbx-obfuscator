@@ -17,10 +17,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
     Frame, Terminal,
 };
 
@@ -30,13 +30,35 @@ use rbxl_obfuscate::{
     ObfuscationLevel, ObfuscationSummary, Options, ProgressEvent,
 };
 
-const APP_TITLE: &str = "Roblox-Obfuscator v1.0";
+const APP_TITLE: &str = "rbx-obfuscator v1.0";
+const STAGE_WEIGHTS_OBFUSCATE: [f64; 3] = [0.15, 0.70, 0.15];
+const STAGE_WEIGHTS_EXTRACT: [f64; 3] = [0.25, 0.55, 0.20];
 const LEVELS: [ObfuscationLevel; 4] = [
     ObfuscationLevel::Minimal,
     ObfuscationLevel::Low,
     ObfuscationLevel::Medium,
     ObfuscationLevel::High,
 ];
+
+struct Theme;
+
+impl Theme {
+    const BACKGROUND: Color = Color::Rgb(0x1e, 0x22, 0x27);
+    const PANEL_BG: Color = Color::Rgb(0x22, 0x27, 0x2e);
+    const PANEL_BG_ACTIVE: Color = Color::Rgb(0x26, 0x32, 0x41);
+    const BORDER: Color = Color::Rgb(0x4b, 0x55, 0x63);
+    const BORDER_DIM: Color = Color::Rgb(0x37, 0x41, 0x51);
+    const BORDER_ACTIVE: Color = Color::Rgb(0x58, 0xa6, 0xff);
+    const TEXT: Color = Color::Rgb(0xdc, 0xe2, 0xeb);
+    const TEXT_MUTED: Color = Color::Rgb(0x9c, 0xa3, 0xaf);
+    const BLUE: Color = Color::Rgb(0x58, 0xa6, 0xff);
+    const GREEN: Color = Color::Rgb(0x5e, 0xe7, 0x87);
+    const YELLOW: Color = Color::Rgb(0xf2, 0xcc, 0x60);
+    const RED: Color = Color::Rgb(0xff, 0x6b, 0x6b);
+    const PURPLE: Color = Color::Rgb(0xd2, 0xa8, 0xff);
+    const PROGRESS_TRACK: Color = Color::Rgb(0x3b, 0x46, 0x54);
+    const PROGRESS_FILL: Color = Color::Rgb(0x58, 0xa6, 0xff);
+}
 
 pub fn run_wizard() -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
@@ -382,17 +404,17 @@ enum StageStatus {
 impl StageStatus {
     fn label(self) -> &'static str {
         match self {
-            Self::Pending => "pending",
-            Self::InProgress => "in progress",
-            Self::Completed => "completed",
+            Self::Pending => "○ Pending",
+            Self::InProgress => "◌ In progress",
+            Self::Completed => "✓ Completed",
         }
     }
 
     fn color(self) -> Color {
         match self {
-            Self::Pending => Color::Gray,
-            Self::InProgress => Color::Yellow,
-            Self::Completed => Color::Green,
+            Self::Pending => Theme::TEXT_MUTED,
+            Self::InProgress => Theme::YELLOW,
+            Self::Completed => Theme::GREEN,
         }
     }
 }
@@ -402,6 +424,7 @@ struct ProgressUiState {
     mode: WizardMode,
     subtitle: &'static str,
     stages: Vec<(String, StageStatus)>,
+    stage_completion: [f64; 3],
     current_stage: usize,
     current_name: String,
     current_thing: String,
@@ -422,12 +445,12 @@ impl ProgressUiState {
                         "Extract scripts from RBXL/RBXM".to_owned(),
                         StageStatus::Pending,
                     ),
-                    ("Obfuscate with Prometheus".to_owned(), StageStatus::Pending),
+                    ("Obfuscating scripts".to_owned(), StageStatus::Pending),
                     ("Compile output file".to_owned(), StageStatus::Pending),
                 ],
             ),
             WizardMode::Extract => (
-                "Extract components in progress",
+                "Extract Components",
                 vec![
                     ("Parse RBXL/RBXM".to_owned(), StageStatus::Pending),
                     ("Export components".to_owned(), StageStatus::Pending),
@@ -440,10 +463,11 @@ impl ProgressUiState {
             mode,
             subtitle,
             stages,
+            stage_completion: [0.0, 0.0, 0.0],
             current_stage: 1,
             current_name: String::new(),
             current_thing: "Preparing".to_owned(),
-            compatibility: "Not attempted".to_owned(),
+            compatibility: "None".to_owned(),
             scripts_completed: 0,
             scripts_total: 0,
             eta: None,
@@ -466,6 +490,11 @@ impl ProgressUiState {
                 if let Some((_, status)) = self.stages.get_mut(stage_index.saturating_sub(1)) {
                     *status = StageStatus::Completed;
                 }
+                if let Some(completion) =
+                    self.stage_completion.get_mut(stage_index.saturating_sub(1))
+                {
+                    *completion = 1.0;
+                }
             }
             ProgressEvent::CurrentItem { value, .. } => self.current_thing = value,
             ProgressEvent::ScriptProgress {
@@ -475,6 +504,12 @@ impl ProgressUiState {
             } => {
                 self.scripts_completed = completed;
                 self.scripts_total = total;
+                if total > 0 && self.current_stage > 0 {
+                    if let Some(completion) = self.stage_completion.get_mut(self.current_stage - 1)
+                    {
+                        *completion = (completed as f64 / total as f64).clamp(0.0, 1.0);
+                    }
+                }
                 if let Some(path) = current_path {
                     self.current_thing = path;
                 }
@@ -484,6 +519,26 @@ impl ProgressUiState {
             ProgressEvent::Warning { message } => self.notice = message,
             ProgressEvent::Finished => {}
         }
+    }
+
+    fn stage_progress(&self) -> f64 {
+        self.stage_completion
+            .get(self.current_stage.saturating_sub(1))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    fn overall_progress(&self) -> f64 {
+        let weights = match self.mode {
+            WizardMode::Obfuscate => STAGE_WEIGHTS_OBFUSCATE,
+            WizardMode::Extract => STAGE_WEIGHTS_EXTRACT,
+        };
+        self.stage_completion
+            .iter()
+            .zip(weights)
+            .map(|(completion, weight)| completion * weight)
+            .sum::<f64>()
+            .clamp(0.0, 1.0)
     }
 }
 
@@ -564,11 +619,20 @@ impl CompletionState {
 fn render_home(frame: &mut Frame<'_>, state: &WizardState) {
     let area = frame.area();
     render_background(frame, area);
-    let chunks = centered_chunks(area);
+    let area = app_area(area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(6),
+            Constraint::Length(15),
+            Constraint::Min(4),
+        ])
+        .split(area);
     render_header(frame, chunks[0], "Interactive setup wizard");
 
     let body_lines = vec![
-        Line::from("Choose what you want to do:"),
+        Line::from(Span::styled("Choose what you want to do:", text_style())),
         Line::from(""),
         option_line(
             state.mode == WizardMode::Obfuscate,
@@ -578,14 +642,18 @@ fn render_home(frame: &mut Frame<'_>, state: &WizardState) {
             state.mode == WizardMode::Extract,
             "Extract RBXL/RBXM Components Only",
         ),
-        Line::from(""),
     ];
-    frame.render_widget(Paragraph::new(body_lines).style(text_style()), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(body_lines)
+            .style(text_style())
+            .block(card_block(None, false, false)),
+        chunks[1],
+    );
 
     let steps = step_lines(state);
     frame.render_widget(
         Paragraph::new(steps)
-            .block(border_block())
+            .block(card_block(Some(" Setup "), true, false))
             .style(text_style())
             .wrap(Wrap { trim: false }),
         chunks[2],
@@ -596,7 +664,7 @@ fn render_home(frame: &mut Frame<'_>, state: &WizardState) {
         chunks[3],
         &[
             state.message.as_str(),
-            "Enter = continue    ↑/↓ = move    ←/→ = change option    q = quit",
+            "Enter = continue | ↑/↓ = move | ←/→ = change option | q = quit",
             "Direct argument mode still works.",
         ],
     );
@@ -605,130 +673,107 @@ fn render_home(frame: &mut Frame<'_>, state: &WizardState) {
 fn render_progress(frame: &mut Frame<'_>, state: &ProgressUiState) {
     let area = frame.area();
     render_background(frame, area);
-    let chunks = centered_chunks(area);
+    let area = app_area(area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(5),
+            Constraint::Min(3),
+        ])
+        .split(area);
     render_header(frame, chunks[0], state.subtitle);
 
-    let stage_header = Line::from(vec![
-        Span::styled(
-            format!("Stage {}/{} ", state.current_stage, state.stages.len()),
-            blue_bold(),
-        ),
-        Span::styled("— ", neutral_style()),
-        Span::styled(state.current_name.clone(), text_style()),
-    ]);
-    frame.render_widget(Paragraph::new(stage_header), chunks[1]);
-
-    let stage_lines: Vec<Line<'_>> = state
-        .stages
-        .iter()
-        .enumerate()
-        .map(|(index, (name, status))| {
-            Line::from(vec![
-                Span::styled(
-                    format!("{}/{} ", index + 1, state.stages.len()),
-                    blue_bold(),
-                ),
-                Span::styled(name.clone(), blue_style()),
-                Span::raw(" ".repeat(2)),
-                Span::styled(status.label(), Style::default().fg(status.color())),
-            ])
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(stage_lines)
-            .block(border_block())
-            .style(text_style()),
-        chunks[2],
-    );
+    render_stage_cards(frame, chunks[1], state);
 
     let eta = state
         .eta
         .map(format_seconds)
         .unwrap_or_else(|| "calculating...".to_owned());
-    let script_label = if state.mode == WizardMode::Extract {
-        "Scripts exported: "
-    } else {
-        "Scripts obfuscated: "
-    };
-    let total = state.scripts_total.max(1);
-    let progress = state.scripts_completed.min(total);
-    let details = vec![
+    let script_line = script_status_line(state);
+    let status_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .split(chunks[2]);
+    let left_lines = vec![
         Line::from(vec![
             Span::styled("Current thing: ", neutral_style()),
-            Span::styled(state.current_thing.clone(), green_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("Compatibility: ", neutral_style()),
-            Span::styled(state.compatibility.clone(), yellow_style()),
-        ]),
-        Line::from(vec![
-            Span::styled(script_label, neutral_style()),
-            Span::styled(
-                format!("{} / {}", state.scripts_completed, state.scripts_total),
-                green_style(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Estimated time remaining: ", neutral_style()),
-            Span::styled(eta, green_style()),
+            Span::styled(state.current_thing.clone(), text_bold_style()),
         ]),
         Line::from(""),
-        progress_line("Overall progress", progress, total),
-        progress_line("Stage progress", progress, total),
+        Line::from(vec![
+            Span::styled("Compatibility: ", purple_style()),
+            Span::styled(state.compatibility.clone(), text_style()),
+        ]),
     ];
     frame.render_widget(
-        Paragraph::new(details)
-            .block(border_block())
-            .style(text_style())
+        Paragraph::new(left_lines)
+            .block(card_block(None, false, false))
+            .wrap(Wrap { trim: false }),
+        status_columns[0],
+    );
+
+    let right_lines = vec![
+        script_line,
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Estimated time remaining:",
+            neutral_style(),
+        )]),
+        Line::from(vec![Span::styled(eta, blue_bold())]),
+    ];
+    frame.render_widget(
+        Paragraph::new(right_lines)
+            .block(card_block(None, false, false))
+            .wrap(Wrap { trim: false }),
+        status_columns[1],
+    );
+
+    let progress_lines = vec![
+        percent_bar_line("Overall progress", state.overall_progress()),
+        percent_bar_line(
+            format!(
+                "Stage progress ({}/{})",
+                state.current_stage,
+                state.stages.len()
+            ),
+            state.stage_progress(),
+        ),
+    ];
+    frame.render_widget(
+        Paragraph::new(progress_lines)
+            .block(card_block(None, false, false))
             .wrap(Wrap { trim: false }),
         chunks[3],
     );
 
-    let earlier_later = vec![
-        Line::from(vec![
-            Span::styled("Earlier: ", neutral_style()),
-            Span::styled(
-                state
-                    .stages
-                    .first()
-                    .map(|stage| stage.0.as_str())
-                    .unwrap_or(""),
-                blue_style(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Later:   ", neutral_style()),
-            Span::styled(
-                state
-                    .stages
-                    .last()
-                    .map(|stage| stage.0.as_str())
-                    .unwrap_or(""),
-                blue_style(),
-            ),
-        ]),
-    ];
-    frame.render_widget(
-        Paragraph::new(earlier_later).block(border_block()),
-        chunks[4],
-    );
-
     let notice = if state.notice.is_empty() {
-        "Press q to cancel    Logs: hidden    Mode: interactive"
+        "Press q to cancel | Logs: hidden | Mode: interactive"
     } else {
         state.notice.as_str()
     };
-    render_footer(frame, chunks[5], &[notice]);
+    render_footer(frame, chunks[4], &[notice]);
 }
 
 fn render_complete(frame: &mut Frame<'_>, state: &CompletionState) {
     let area = frame.area();
     render_background(frame, area);
-    let chunks = centered_chunks(area);
+    let area = app_area(area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Min(14),
+            Constraint::Length(3),
+        ])
+        .split(area);
     render_header(frame, chunks[0], "Operation complete");
 
     frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled("[✓] Done", green_style())])),
+        Paragraph::new(Line::from(vec![Span::styled("[✓] Done", green_bold())])),
         chunks[1],
     );
 
@@ -757,70 +802,159 @@ fn render_complete(frame: &mut Frame<'_>, state: &CompletionState) {
     if let Some(backup) = &state.backup {
         summary.push(summary_line("Backup", backup, false));
     }
-    frame.render_widget(Paragraph::new(summary).block(border_block()), chunks[2]);
 
     let command_lines = state
         .command
         .lines()
         .map(|line| Line::from(Span::styled(line.to_owned(), green_style())))
         .collect::<Vec<_>>();
+    let body = if chunks[2].width >= 90 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(chunks[2])
+            .to_vec()
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(chunks[2])
+            .to_vec()
+    };
     frame.render_widget(
-        Paragraph::new(command_lines).block(border_block().title(" Equivalent direct command ")),
-        chunks[3],
+        Paragraph::new(summary)
+            .block(card_block(Some(" Summary "), false, false))
+            .wrap(Wrap { trim: false }),
+        body[0],
     );
 
-    render_footer(
-        frame,
-        chunks[4],
-        &[
-            "Enter = exit    c = copy command unavailable    q = quit",
-            "The direct command is shown above.",
-        ],
+    let mut command_card_lines = command_lines;
+    command_card_lines.push(Line::from(""));
+    command_card_lines.push(Line::from(Span::styled(
+        "Run the above command next time to skip the wizard.",
+        neutral_style(),
+    )));
+    frame.render_widget(
+        Paragraph::new(command_card_lines)
+            .block(card_block(
+                Some(" Equivalent direct command "),
+                false,
+                false,
+            ))
+            .wrap(Wrap { trim: false }),
+        body[1],
     );
+
+    render_footer(frame, chunks[3], &["Enter = exit | q = quit"]);
 }
 
-fn centered_chunks(area: Rect) -> Vec<Rect> {
-    Layout::default()
-        .direction(Direction::Vertical)
+fn render_stage_cards(frame: &mut Frame<'_>, area: Rect, state: &ProgressUiState) {
+    let cards = Layout::default()
+        .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(5),
-            Constraint::Min(3),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
         ])
-        .margin(2)
-        .split(area)
-        .to_vec()
+        .split(area);
+
+    for (index, card_area) in cards.iter().enumerate() {
+        let stage_number = index + 1;
+        let (name, status) = &state.stages[index];
+        let active = stage_number == state.current_stage;
+        let dim = matches!(status, StageStatus::Pending);
+        let title_style = if active {
+            blue_bold()
+        } else {
+            text_bold_style()
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("{stage_number}/{}", state.stages.len()),
+                if matches!(status, StageStatus::Completed) {
+                    green_bold()
+                } else {
+                    title_style
+                },
+            )),
+            Line::from(Span::styled(
+                name.clone(),
+                if dim { neutral_style() } else { text_style() },
+            )),
+            Line::from(Span::styled(
+                status.label(),
+                Style::default().fg(status.color()),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(card_block(None, active, dim))
+                .wrap(Wrap { trim: false }),
+            *card_area,
+        );
+    }
+}
+
+fn script_status_line(state: &ProgressUiState) -> Line<'static> {
+    if state.scripts_total == 0 {
+        let label = match state.mode {
+            WizardMode::Obfuscate => "Scripts discovered:",
+            WizardMode::Extract => "Scripts exported:",
+        };
+        return Line::from(vec![
+            Span::styled(label.to_owned(), neutral_style()),
+            Span::raw(" "),
+            Span::styled("calculating...", yellow_style()),
+        ]);
+    }
+
+    let label = match state.mode {
+        WizardMode::Obfuscate => "Scripts obfuscated:",
+        WizardMode::Extract => "Scripts exported:",
+    };
+    Line::from(vec![
+        Span::styled(label.to_owned(), neutral_style()),
+        Span::raw(" "),
+        Span::styled(state.scripts_completed.to_string(), yellow_style()),
+        Span::styled(format!(" / {}", state.scripts_total), text_style()),
+    ])
 }
 
 fn render_background(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Black)),
+        Block::default().style(Style::default().bg(Theme::BACKGROUND)),
         area,
     );
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, subtitle: &str) {
-    let lines = vec![
-        Line::from(Span::styled(APP_TITLE, blue_bold())).centered(),
-        Line::from(Span::styled(subtitle, neutral_style())).centered(),
-    ];
-    frame.render_widget(Paragraph::new(lines).block(border_block()), area);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(APP_TITLE, blue_bold()))).alignment(Alignment::Left),
+        columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(subtitle, neutral_style())))
+            .alignment(Alignment::Right),
+        columns[1],
+    );
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, lines: &[&str]) {
     let lines = lines
         .iter()
-        .map(|line| Line::from(Span::styled(*line, neutral_style())))
+        .map(|line| footer_line(line))
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::TOP)
-                .border_style(border_style()),
+                .border_style(border_dim_style())
+                .style(Style::default().bg(Theme::BACKGROUND)),
         ),
         area,
     );
@@ -842,6 +976,10 @@ fn step_lines(state: &WizardState) -> Vec<Line<'_>> {
             state.step == WizardStep::Input,
         ),
         step_value(&state.input),
+        Line::from(Span::styled(
+            "  ─────────────────────────────────────────",
+            dim_style(),
+        )),
         step_title(
             2,
             output_label,
@@ -849,6 +987,10 @@ fn step_lines(state: &WizardState) -> Vec<Line<'_>> {
             state.step == WizardStep::Output,
         ),
         step_value(&state.output),
+        Line::from(Span::styled(
+            "  ─────────────────────────────────────────",
+            dim_style(),
+        )),
         step_title(
             3,
             "Prometheus level",
@@ -856,26 +998,39 @@ fn step_lines(state: &WizardState) -> Vec<Line<'_>> {
             state.step == WizardStep::Level,
         ),
         level_line(state),
+        Line::from(Span::styled(
+            "  ─────────────────────────────────────────",
+            dim_style(),
+        )),
         step_title(4, "Run", false, state.step == WizardStep::Run),
+        Line::from(Span::styled("  Press Enter to start", neutral_style())),
     ]
 }
 
 fn step_title(index: usize, title: &str, checked: bool, active: bool) -> Line<'_> {
-    let marker = if checked { " ✓" } else { "" };
-    let style = if active { yellow_style() } else { blue_bold() };
-    Line::from(vec![
+    let marker = if checked { "  ✓" } else { "" };
+    let style = if active {
+        blue_bold()
+    } else {
+        text_bold_style()
+    };
+    let line = Line::from(vec![
         Span::styled(format!("{index}. "), style),
         Span::styled(format!("{title}{marker}"), style),
-    ])
+    ]);
+    if active {
+        line.style(Style::default().bg(Theme::PANEL_BG_ACTIVE))
+    } else {
+        line
+    }
 }
 
 fn step_value(value: &str) -> Line<'_> {
-    let value = if value.trim().is_empty() {
-        "  <paste path here>"
+    if value.trim().is_empty() {
+        Line::from(Span::styled("  Waiting for path...", neutral_style()))
     } else {
-        value
-    };
-    Line::from(Span::styled(format!("  {value}"), green_style()))
+        Line::from(Span::styled(format!("  {value}"), green_style()))
+    }
 }
 
 fn level_line(state: &WizardState) -> Line<'_> {
@@ -897,7 +1052,10 @@ fn level_line(state: &WizardState) -> Line<'_> {
                 Span::styled(
                     text,
                     if index == state.level_index {
-                        yellow_style()
+                        Style::default()
+                            .fg(Theme::TEXT)
+                            .bg(Theme::BLUE)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         neutral_style()
                     },
@@ -910,7 +1068,7 @@ fn level_line(state: &WizardState) -> Line<'_> {
 }
 
 fn option_line(selected: bool, text: &str) -> Line<'_> {
-    Line::from(vec![
+    let line = Line::from(vec![
         Span::styled(if selected { ">  " } else { "   " }, text_style()),
         Span::styled(
             text.to_owned(),
@@ -920,27 +1078,28 @@ fn option_line(selected: bool, text: &str) -> Line<'_> {
                 text_style()
             },
         ),
-    ])
+    ]);
+    if selected {
+        line.style(Style::default().bg(Theme::PANEL_BG_ACTIVE))
+    } else {
+        line
+    }
 }
 
-fn progress_line(label: &str, completed: usize, total: usize) -> Line<'_> {
-    let width = 36usize;
-    let filled = completed
-        .saturating_mul(width)
-        .checked_div(total)
-        .unwrap_or(0)
-        .min(width);
-    let percent = completed
-        .saturating_mul(100)
-        .checked_div(total)
-        .unwrap_or(0);
+fn percent_bar_line(label: impl Into<String>, progress: f64) -> Line<'static> {
+    let width = 38usize;
+    let progress = progress.clamp(0.0, 1.0);
+    let filled = (progress * width as f64).round() as usize;
+    let percent = (progress * 100.0).round() as usize;
+    let label = label.into();
     Line::from(vec![
-        Span::styled(format!("{label}: "), neutral_style()),
-        Span::styled("[", neutral_style()),
-        Span::styled("█".repeat(filled), green_style()),
-        Span::styled("·".repeat(width - filled), neutral_style()),
-        Span::styled("] ", neutral_style()),
-        Span::styled(format!("{percent}% ({completed} / {total})"), green_style()),
+        Span::styled(format!("{label:<22} "), neutral_style()),
+        Span::styled("━".repeat(filled.min(width)), progress_fill_style()),
+        Span::styled(
+            "━".repeat(width.saturating_sub(filled.min(width))),
+            progress_track_style(),
+        ),
+        Span::styled(format!("  {percent:>3}%"), text_bold_style()),
     ])
 }
 
@@ -958,39 +1117,129 @@ fn summary_line(label: &str, value: &str, path_value: bool) -> Line<'static> {
     ])
 }
 
-fn border_block() -> Block<'static> {
-    Block::default()
+fn card_block(title: Option<&'static str>, active: bool, dim: bool) -> Block<'static> {
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border_style())
-        .style(Style::default().bg(Color::Black))
+        .border_type(BorderType::Rounded)
+        .border_style(if active {
+            active_border_style()
+        } else if dim {
+            border_dim_style()
+        } else {
+            border_style()
+        })
+        .padding(Padding::new(2, 2, 0, 0))
+        .style(Style::default().fg(Theme::TEXT).bg(if active {
+            Theme::PANEL_BG_ACTIVE
+        } else {
+            Theme::PANEL_BG
+        }));
+    if let Some(title) = title {
+        block = block.title(Span::styled(title, blue_bold()));
+    }
+    block
+}
+
+fn app_area(area: Rect) -> Rect {
+    let horizontal = if area.width >= 110 { 4 } else { 3 };
+    Rect {
+        x: area.x + horizontal,
+        y: area.y + 1,
+        width: area.width.saturating_sub(horizontal * 2),
+        height: area.height.saturating_sub(2),
+    }
 }
 
 fn blue_bold() -> Style {
     blue_style().add_modifier(Modifier::BOLD)
 }
 
+fn green_bold() -> Style {
+    green_style().add_modifier(Modifier::BOLD)
+}
+
+fn text_bold_style() -> Style {
+    text_style().add_modifier(Modifier::BOLD)
+}
+
 fn blue_style() -> Style {
-    Style::default().fg(Color::Blue).bg(Color::Black)
+    Style::default().fg(Theme::BLUE)
 }
 
 fn green_style() -> Style {
-    Style::default().fg(Color::Green).bg(Color::Black)
+    Style::default().fg(Theme::GREEN)
 }
 
 fn yellow_style() -> Style {
-    Style::default().fg(Color::Yellow).bg(Color::Black)
+    Style::default().fg(Theme::YELLOW)
+}
+
+fn purple_style() -> Style {
+    Style::default().fg(Theme::PURPLE)
 }
 
 fn neutral_style() -> Style {
-    Style::default().fg(Color::Gray).bg(Color::Black)
+    Style::default().fg(Theme::TEXT_MUTED)
+}
+
+fn dim_style() -> Style {
+    Style::default().fg(Theme::BORDER_DIM).bg(Theme::PANEL_BG)
 }
 
 fn text_style() -> Style {
-    Style::default().fg(Color::White).bg(Color::Black)
+    Style::default().fg(Theme::TEXT)
 }
 
 fn border_style() -> Style {
-    Style::default().fg(Color::Gray).bg(Color::Black)
+    Style::default().fg(Theme::BORDER).bg(Theme::PANEL_BG)
+}
+
+fn border_dim_style() -> Style {
+    Style::default().fg(Theme::BORDER_DIM).bg(Theme::BACKGROUND)
+}
+
+fn active_border_style() -> Style {
+    Style::default()
+        .fg(Theme::BORDER_ACTIVE)
+        .bg(Theme::PANEL_BG_ACTIVE)
+}
+
+fn progress_track_style() -> Style {
+    Style::default()
+        .fg(Theme::PROGRESS_TRACK)
+        .bg(Theme::PANEL_BG)
+}
+
+fn progress_fill_style() -> Style {
+    Style::default()
+        .fg(Theme::PROGRESS_FILL)
+        .bg(Theme::PANEL_BG)
+}
+
+fn danger_style() -> Style {
+    Style::default().fg(Theme::RED)
+}
+
+fn footer_line(line: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, part) in line.split('|').enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" | ", Style::default().fg(Theme::BORDER_DIM)));
+        }
+        let trimmed = part.trim();
+        if let Some((key, rest)) = trimmed.split_once('=') {
+            spans.push(Span::styled(key.trim().to_owned(), blue_bold()));
+            spans.push(Span::styled(" = ", neutral_style()));
+            spans.push(Span::styled(rest.trim().to_owned(), neutral_style()));
+        } else if trimmed == "Press q to cancel" {
+            spans.push(Span::styled("Press ", neutral_style()));
+            spans.push(Span::styled("q", danger_style()));
+            spans.push(Span::styled(" to cancel", neutral_style()));
+        } else {
+            spans.push(Span::styled(trimmed.to_owned(), neutral_style()));
+        }
+    }
+    Line::from(spans)
 }
 
 fn clean_path_input(value: &str) -> String {
@@ -1029,6 +1278,19 @@ mod tests {
     }
 
     #[test]
+    fn ui_uses_rbx_obfuscator_branding() {
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = WizardState::default();
+
+        terminal.draw(|frame| render_home(frame, &state)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("rbx-obfuscator v1.0"));
+        assert!(!text.contains("Roblox-Obfuscator"));
+    }
+
+    #[test]
     fn progress_screen_renders_without_panicking() {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1047,6 +1309,57 @@ mod tests {
         terminal
             .draw(|frame| render_progress(frame, &state))
             .unwrap();
+    }
+
+    #[test]
+    fn weighted_overall_progress_differs_from_stage_progress() {
+        let mut state = ProgressUiState::new(WizardMode::Obfuscate);
+        state.apply(ProgressEvent::StageStarted {
+            stage_index: 1,
+            stage_total: 3,
+            name: "Extract scripts from RBXL/RBXM".to_owned(),
+        });
+        state.apply(ProgressEvent::StageCompleted {
+            stage_index: 1,
+            stage_total: 3,
+            name: "Extract scripts from RBXL/RBXM".to_owned(),
+        });
+        state.apply(ProgressEvent::StageStarted {
+            stage_index: 2,
+            stage_total: 3,
+            name: "Obfuscate with Prometheus".to_owned(),
+        });
+        state.apply(ProgressEvent::ScriptProgress {
+            completed: 49,
+            total: 300,
+            current_path: Some("VehicleController.client.luau".to_owned()),
+        });
+
+        assert_ne!(
+            (state.overall_progress() * 100.0).round() as usize,
+            (state.stage_progress() * 100.0).round() as usize
+        );
+    }
+
+    #[test]
+    fn stage_one_does_not_render_zero_over_zero_scripts() {
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = ProgressUiState::new(WizardMode::Obfuscate);
+        state.apply(ProgressEvent::StageStarted {
+            stage_index: 1,
+            stage_total: 3,
+            name: "Extract scripts from RBXL/RBXM".to_owned(),
+        });
+
+        terminal
+            .draw(|frame| render_progress(frame, &state))
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("Scripts discovered"));
+        assert!(text.contains("calculating"));
+        assert!(!text.contains("Scripts obfuscated: 0 / 0"));
     }
 
     #[test]
@@ -1075,8 +1388,51 @@ mod tests {
     }
 
     #[test]
+    fn completion_command_uses_rbx_obfuscator_and_no_copy_unavailable_footer() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = CompletionState {
+            mode: "Full Obfuscation".to_owned(),
+            input: "~/Documents/train game.rbxl".to_owned(),
+            output_label: "Output".to_owned(),
+            output: "~/Documents/train game-obfuscated_High.rbxl".to_owned(),
+            level: Some("Strong".to_owned()),
+            scripts_label: "Scripts obfuscated".to_owned(),
+            scripts_line: Some("18 / 19".to_owned()),
+            guis_line: None,
+            content_refs_line: None,
+            duration: Duration::from_secs(8),
+            backup: Some("Not requested".to_owned()),
+            command: "rbx-obfuscator \\\n  \"~/Documents/train game.rbxl\" \\\n  \"~/Documents/train game-obfuscated_High.rbxl\" \\\n  --level high"
+                .to_owned(),
+        };
+
+        terminal
+            .draw(|frame| render_complete(frame, &state))
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("rbx-obfuscator"));
+        assert!(!text.contains("copy command unavailable"));
+    }
+
+    #[test]
     fn eta_format_handles_zero_seconds() {
         assert_eq!(format_seconds(0), "00:00");
         assert_eq!(format_seconds(137), "02:17");
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = *buffer.area();
+        let mut text = String::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+            text.push('\n');
+        }
+        text
     }
 }
