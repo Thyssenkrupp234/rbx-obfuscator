@@ -1,12 +1,12 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::HashSet,
     env,
     ffi::OsString,
     fs::{self, File},
     io::ErrorKind,
     io::{BufReader, BufWriter},
     path::{Component, Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,6 +28,8 @@ const PROMETHEUS_INSTALL_COMMAND: &str =
     "curl -fsSL https://raw.githubusercontent.com/prometheus-lua/Prometheus/master/install.sh | sh";
 const PROMETHEUS_UPDATE_STATE_FILE: &str = "prometheus-last-update";
 const PROMETHEUS_UPDATE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const LONG_SCRIPT_PROMPT_AFTER: Duration = Duration::from_secs(10);
+const LONG_SCRIPT_AUTO_AFTER: Duration = Duration::from_secs(30);
 const LUAU_IF_HELPER_NAME: &str = "__rbx_obfuscator_luau_if";
 const LUAU_IF_HELPER: &str = "local function __rbx_obfuscator_luau_if(condition, truthy, falsy)\n\tif condition then\n\t\treturn truthy()\n\tend\n\treturn falsy()\nend\n\n";
 
@@ -152,10 +154,46 @@ pub enum ProgressEvent {
     EtaUpdated {
         seconds_remaining: Option<u64>,
     },
+    LongScriptPrompt {
+        script_path: String,
+        elapsed_secs: u64,
+        preset: String,
+        can_minify: bool,
+        phase: LongScriptPhase,
+        message: String,
+    },
+    LongScriptDecision {
+        script_path: String,
+        action: LongScriptAction,
+        message: String,
+    },
     Warning {
         message: String,
     },
     Finished,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LongScriptAction {
+    KeepWaiting,
+    SwitchToMinify,
+    Skip,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LongScriptPhase {
+    Prompt,
+    AutoSwitchToMinify,
+    MinifyPrompt,
+    AutoSkip,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LongScriptContext {
+    pub script_path: String,
+    pub elapsed_secs: u64,
+    pub preset: String,
+    pub phase: LongScriptPhase,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,6 +267,24 @@ struct PrometheusFailure {
     luau_compatibility_applied: bool,
 }
 
+#[derive(Debug)]
+enum ScriptTransformOutcome {
+    Transformed {
+        source: String,
+        luau_compatibility_applied: bool,
+    },
+    Skipped {
+        reason: String,
+    },
+}
+
+#[derive(Debug)]
+enum PrometheusAttemptOutcome {
+    Transformed(String),
+    SwitchToMinify,
+    Skip(String),
+}
+
 pub fn run(options: Options) -> Result<()> {
     let verbose = options.verbose;
     run_with_progress(options, |event| render_console_progress(event, verbose)).map(|_| ())
@@ -243,11 +299,30 @@ where
 
 pub fn run_with_progress_controlled<C, F>(
     options: Options,
+    should_cancel: C,
+    progress: F,
+) -> Result<ObfuscationSummary>
+where
+    C: FnMut() -> bool,
+    F: FnMut(ProgressEvent),
+{
+    run_with_progress_controlled_and_script_actions(
+        options,
+        should_cancel,
+        |_| None,
+        progress,
+    )
+}
+
+pub fn run_with_progress_controlled_and_script_actions<C, S, F>(
+    options: Options,
     mut should_cancel: C,
+    mut script_action: S,
     mut progress: F,
 ) -> Result<ObfuscationSummary>
 where
     C: FnMut() -> bool,
+    S: FnMut(LongScriptContext) -> Option<LongScriptAction>,
     F: FnMut(ProgressEvent),
 {
     let started_at = Instant::now();
@@ -406,7 +481,8 @@ where
             .as_ref()
             .expect("Prometheus temp dir must exist outside dry-run")
             .path();
-        let (transformed, luau_compatibility_applied) = match run_prometheus_with_type_fallback(
+        let script_started_at = Instant::now();
+        let transform = match run_prometheus_with_type_fallback(
             &prometheus_path,
             &script.source,
             options.obfuscation_level,
@@ -414,6 +490,8 @@ where
             options.strip_types,
             &script.path,
             options.verbose,
+            &mut progress,
+            &mut script_action,
         ) {
             Ok(result) => result,
             Err(failure) => {
@@ -456,6 +534,36 @@ where
             }
         };
 
+        let (transformed, luau_compatibility_applied) = match transform {
+            ScriptTransformOutcome::Transformed {
+                source,
+                luau_compatibility_applied,
+            } => (source, luau_compatibility_applied),
+            ScriptTransformOutcome::Skipped { reason } => {
+                skipped += 1;
+                let progress_path = script.path.clone();
+                progress(ProgressEvent::Warning {
+                    message: format!("Skipped {}; {reason}", script.path),
+                });
+                manifest_entries.push(ManifestEntry {
+                    path: script.path,
+                    class_name: script.class_name,
+                    action: ManifestAction::Skipped,
+                    source_bytes: script.source.len(),
+                    transformed_bytes: None,
+                    luau_compatibility_applied: false,
+                    backup_path,
+                    error: Some(reason),
+                });
+                progress(ProgressEvent::ScriptProgress {
+                    completed: processed + skipped + failed_scripts.len(),
+                    total: total_scripts,
+                    current_path: Some(progress_path),
+                });
+                continue;
+            }
+        };
+
         let instance = dom
             .get_by_ref_mut(script.referent)
             .ok_or_else(|| anyhow!("script disappeared from DOM: {}", script.path))?;
@@ -480,7 +588,7 @@ where
                 message: "Luau compatibility preprocessing applied".to_owned(),
             });
         }
-        eta.record_script();
+        eta.record_script(script_started_at.elapsed());
         progress(ProgressEvent::EtaUpdated {
             seconds_remaining: eta.seconds_remaining(processed, total_scripts),
         });
@@ -612,6 +720,8 @@ fn render_console_progress(event: ProgressEvent, verbose: bool) {
             }
         }
         ProgressEvent::Warning { message } => eprintln!("warning: {message}"),
+        ProgressEvent::LongScriptPrompt { message, .. } => eprintln!("long script: {message}"),
+        ProgressEvent::LongScriptDecision { message, .. } => eprintln!("long script: {message}"),
         ProgressEvent::Finished => eprintln!("Done"),
         ProgressEvent::CurrentItem { label, value } if verbose => eprintln!("{label}: {value}"),
         ProgressEvent::CompatibilityNote { message } if verbose => eprintln!("{message}"),
@@ -624,33 +734,25 @@ fn render_console_progress(event: ProgressEvent, verbose: bool) {
 
 #[derive(Default)]
 struct EtaTracker {
-    samples: VecDeque<Duration>,
-    last_tick: Option<Instant>,
+    completed_samples: usize,
+    total_sample_duration: Duration,
 }
 
 impl EtaTracker {
-    fn record_script(&mut self) {
-        let now = Instant::now();
-        if let Some(last_tick) = self.last_tick {
-            self.samples
-                .push_back(now.saturating_duration_since(last_tick));
-            if self.samples.len() > 10 {
-                self.samples.pop_front();
-            }
-        }
-        self.last_tick = Some(now);
+    fn record_script(&mut self, duration: Duration) {
+        self.completed_samples += 1;
+        self.total_sample_duration += duration;
     }
 
     fn seconds_remaining(&self, completed: usize, total: usize) -> Option<u64> {
-        if completed >= total || self.samples.len() < 3 {
+        if completed >= total || self.completed_samples < 3 {
             return None;
         }
         let remaining = total.saturating_sub(completed);
         if remaining == 0 {
             return Some(0);
         }
-        let total_sample_seconds = self.samples.iter().map(Duration::as_secs_f64).sum::<f64>();
-        let average = total_sample_seconds / self.samples.len() as f64;
+        let average = self.total_sample_duration.as_secs_f64() / self.completed_samples as f64;
         Some((average * remaining as f64).round() as u64)
     }
 }
@@ -968,7 +1070,7 @@ fn is_script_class(class_name: &str) -> bool {
     SCRIPT_CLASSES.contains(&class_name)
 }
 
-fn run_prometheus_with_type_fallback(
+fn run_prometheus_with_type_fallback<S, F>(
     prometheus_path: &Path,
     input_source: &str,
     level: ObfuscationLevel,
@@ -976,19 +1078,69 @@ fn run_prometheus_with_type_fallback(
     strip_types: bool,
     script_path: &str,
     verbose: bool,
-) -> std::result::Result<(String, bool), PrometheusFailure> {
+    progress: &mut F,
+    script_action: &mut S,
+) -> std::result::Result<ScriptTransformOutcome, PrometheusFailure>
+where
+    S: FnMut(LongScriptContext) -> Option<LongScriptAction>,
+    F: FnMut(ProgressEvent),
+{
+    let level_preset = prometheus_preset_for_level(level);
+
     if strip_types {
         let prepared = prepare_luau_for_prometheus(input_source);
-        return run_prometheus(prometheus_path, &prepared, level, temp_dir, verbose)
-            .map(|transformed| (transformed, true))
-            .map_err(|error| PrometheusFailure {
-                error,
-                luau_compatibility_applied: true,
-            });
+        return run_prometheus_attempt(
+            prometheus_path,
+            &prepared,
+            level_preset,
+            temp_dir,
+            script_path,
+            verbose,
+            true,
+            progress,
+            script_action,
+        )
+        .and_then(|outcome| {
+            handle_attempt_outcome(
+                outcome,
+                prometheus_path,
+                &prepared,
+                temp_dir,
+                script_path,
+                verbose,
+                true,
+                progress,
+                script_action,
+            )
+        })
+        .map_err(|error| PrometheusFailure {
+            error,
+            luau_compatibility_applied: true,
+        });
     }
 
-    match run_prometheus(prometheus_path, input_source, level, temp_dir, verbose) {
-        Ok(transformed) => Ok((transformed, false)),
+    match run_prometheus_attempt(
+        prometheus_path,
+        input_source,
+        level_preset,
+        temp_dir,
+        script_path,
+        verbose,
+        true,
+        progress,
+        script_action,
+    ) {
+        Ok(outcome) => handle_attempt_outcome(
+            outcome,
+            prometheus_path,
+            input_source,
+            temp_dir,
+            script_path,
+            verbose,
+            false,
+            progress,
+            script_action,
+        ),
         Err(original_error) => {
             let prepared = prepare_luau_for_prometheus(input_source);
             if prepared == input_source {
@@ -1004,25 +1156,101 @@ fn run_prometheus_with_type_fallback(
                     script_path
                 );
             }
-            run_prometheus(prometheus_path, &prepared, level, temp_dir, verbose)
-                .map(|transformed| (transformed, true))
-                .map_err(|fallback_error| PrometheusFailure {
-                    error: anyhow!(
-                        "Prometheus also failed after Luau compatibility preprocessing; original error: {original_error:#}; fallback error: {fallback_error:#}"
-                    ),
-                    luau_compatibility_applied: true,
-                })
+            run_prometheus_attempt(
+                prometheus_path,
+                &prepared,
+                level_preset,
+                temp_dir,
+                script_path,
+                verbose,
+                true,
+                progress,
+                script_action,
+            )
+            .and_then(|outcome| {
+                handle_attempt_outcome(
+                    outcome,
+                    prometheus_path,
+                    &prepared,
+                    temp_dir,
+                    script_path,
+                    verbose,
+                    true,
+                    progress,
+                    script_action,
+                )
+            })
+            .map_err(|fallback_error| PrometheusFailure {
+                error: anyhow!(
+                    "Prometheus also failed after Luau compatibility preprocessing; original error: {original_error:#}; fallback error: {fallback_error:#}"
+                ),
+                luau_compatibility_applied: true,
+            })
         }
     }
 }
 
-fn run_prometheus(
+fn handle_attempt_outcome<S, F>(
+    outcome: PrometheusAttemptOutcome,
     prometheus_path: &Path,
     input_source: &str,
-    level: ObfuscationLevel,
     temp_dir: &Path,
+    script_path: &str,
     verbose: bool,
-) -> Result<String> {
+    luau_compatibility_applied: bool,
+    progress: &mut F,
+    script_action: &mut S,
+) -> Result<ScriptTransformOutcome>
+where
+    S: FnMut(LongScriptContext) -> Option<LongScriptAction>,
+    F: FnMut(ProgressEvent),
+{
+    match outcome {
+        PrometheusAttemptOutcome::Transformed(source) => Ok(ScriptTransformOutcome::Transformed {
+            source,
+            luau_compatibility_applied,
+        }),
+        PrometheusAttemptOutcome::Skip(reason) => Ok(ScriptTransformOutcome::Skipped { reason }),
+        PrometheusAttemptOutcome::SwitchToMinify => run_prometheus_attempt(
+            prometheus_path,
+            input_source,
+            "Minify",
+            temp_dir,
+            script_path,
+            verbose,
+            false,
+            progress,
+            script_action,
+        )
+        .and_then(|minify_outcome| match minify_outcome {
+            PrometheusAttemptOutcome::Transformed(source) => Ok(ScriptTransformOutcome::Transformed {
+                source,
+                luau_compatibility_applied,
+            }),
+            PrometheusAttemptOutcome::Skip(reason) => Ok(ScriptTransformOutcome::Skipped { reason }),
+            PrometheusAttemptOutcome::SwitchToMinify => Ok(ScriptTransformOutcome::Skipped {
+                reason: "Minify was already active; script skipped to avoid hanging".to_owned(),
+            }),
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_prometheus_attempt<S, F>(
+    prometheus_path: &Path,
+    input_source: &str,
+    preset: &str,
+    temp_dir: &Path,
+    script_path: &str,
+    verbose: bool,
+    allow_switch_to_minify: bool,
+    progress: &mut F,
+    script_action: &mut S,
+) -> Result<PrometheusAttemptOutcome>
+where
+    S: FnMut(LongScriptContext) -> Option<LongScriptAction>,
+    F: FnMut(ProgressEvent),
+{
     let input_file = TempFileBuilder::new()
         .prefix("rbx-obfuscator-input-")
         .suffix(".luau")
@@ -1053,21 +1281,34 @@ fn run_prometheus(
     let output_path = output_file.path().to_path_buf();
     drop(output_file);
 
-    let status_output = Command::new(prometheus_path)
-        .args(prometheus_args_for(level, &output_path, input_file.path()))
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to launch Prometheus executable {}",
-                prometheus_path.display()
-            )
-        })?;
+    let process_outcome = run_prometheus_process(
+        prometheus_path,
+        preset,
+        &output_path,
+        input_file.path(),
+        script_path,
+        allow_switch_to_minify,
+        progress,
+        script_action,
+    )?;
+
+    let status_output = match process_outcome {
+        PrometheusProcessOutcome::Output(output) => output,
+        PrometheusProcessOutcome::SwitchToMinify => {
+            let _ = fs::remove_file(&output_path);
+            return Ok(PrometheusAttemptOutcome::SwitchToMinify);
+        }
+        PrometheusProcessOutcome::Skip(reason) => {
+            let _ = fs::remove_file(&output_path);
+            return Ok(PrometheusAttemptOutcome::Skip(reason));
+        }
+    };
 
     if !status_output.status.success() {
         bail!(
             "Prometheus exited with status {} using preset {}. {}",
             status_output.status,
-            prometheus_preset_for_level(level),
+            preset,
             command_output_summary(&status_output, verbose)
         );
     }
@@ -1085,22 +1326,247 @@ fn run_prometheus(
         bail!(
             "Prometheus produced empty output file {} using preset {}",
             output_path.display(),
-            prometheus_preset_for_level(level)
+            preset
         );
     }
 
     let _ = fs::remove_file(&output_path);
-    Ok(transformed)
+    Ok(PrometheusAttemptOutcome::Transformed(transformed))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_prometheus_process<S, F>(
+    prometheus_path: &Path,
+    preset: &str,
+    output_path: &Path,
+    input_path: &Path,
+    script_path: &str,
+    allow_switch_to_minify: bool,
+    progress: &mut F,
+    script_action: &mut S,
+) -> Result<PrometheusProcessOutcome>
+where
+    S: FnMut(LongScriptContext) -> Option<LongScriptAction>,
+    F: FnMut(ProgressEvent),
+{
+    let mut child = Command::new(prometheus_path)
+        .args(prometheus_args_for_preset(preset, output_path, input_path))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to launch Prometheus executable {}",
+                prometheus_path.display()
+            )
+        })?;
+
+    let started_at = Instant::now();
+    let mut prompt_sent = false;
+    let mut auto_decision_checked = false;
+    let is_minify = preset == "Minify";
+
+    loop {
+        if child
+            .try_wait()
+            .context("failed to poll Prometheus process")?
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .context("failed to collect Prometheus process output")?;
+            return Ok(PrometheusProcessOutcome::Output(output));
+        }
+
+        let elapsed = started_at.elapsed();
+        if elapsed >= LONG_SCRIPT_PROMPT_AFTER && !prompt_sent {
+            prompt_sent = true;
+            let phase = if is_minify {
+                LongScriptPhase::MinifyPrompt
+            } else {
+                LongScriptPhase::Prompt
+            };
+            progress(ProgressEvent::LongScriptPrompt {
+                script_path: script_path.to_owned(),
+                elapsed_secs: elapsed.as_secs(),
+                preset: preset.to_owned(),
+                can_minify: allow_switch_to_minify,
+                phase,
+                message: long_script_prompt_message(script_path, preset, allow_switch_to_minify, phase),
+            });
+        }
+
+        if prompt_sent {
+            let prompt_phase = if is_minify {
+                LongScriptPhase::MinifyPrompt
+            } else {
+                LongScriptPhase::Prompt
+            };
+            if let Some(action) = script_action(LongScriptContext {
+                script_path: script_path.to_owned(),
+                elapsed_secs: elapsed.as_secs(),
+                preset: preset.to_owned(),
+                phase: prompt_phase,
+            }) {
+                if let Some(outcome) = apply_long_script_action(
+                    action,
+                    &mut child,
+                    script_path,
+                    preset,
+                    allow_switch_to_minify,
+                    progress,
+                )? {
+                    return Ok(outcome);
+                }
+            }
+        }
+
+        if elapsed >= LONG_SCRIPT_AUTO_AFTER && !auto_decision_checked {
+            auto_decision_checked = true;
+            let phase = if is_minify {
+                LongScriptPhase::AutoSkip
+            } else {
+                LongScriptPhase::AutoSwitchToMinify
+            };
+            let default_action = if is_minify {
+                LongScriptAction::Skip
+            } else if allow_switch_to_minify {
+                LongScriptAction::SwitchToMinify
+            } else {
+                LongScriptAction::KeepWaiting
+            };
+            let action = script_action(LongScriptContext {
+                script_path: script_path.to_owned(),
+                elapsed_secs: elapsed.as_secs(),
+                preset: preset.to_owned(),
+                phase,
+            })
+            .unwrap_or(default_action);
+
+            if let Some(outcome) = apply_long_script_action(
+                action,
+                &mut child,
+                script_path,
+                preset,
+                allow_switch_to_minify,
+                progress,
+            )? {
+                return Ok(outcome);
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[derive(Debug)]
+enum PrometheusProcessOutcome {
+    Output(Output),
+    SwitchToMinify,
+    Skip(String),
+}
+
+fn apply_long_script_action<F>(
+    action: LongScriptAction,
+    child: &mut std::process::Child,
+    script_path: &str,
+    preset: &str,
+    allow_switch_to_minify: bool,
+    progress: &mut F,
+) -> Result<Option<PrometheusProcessOutcome>>
+where
+    F: FnMut(ProgressEvent),
+{
+    match action {
+        LongScriptAction::KeepWaiting => {
+            progress(ProgressEvent::LongScriptDecision {
+                script_path: script_path.to_owned(),
+                action,
+                message: format!("Keeping {script_path} on preset {preset}"),
+            });
+            Ok(None)
+        }
+        LongScriptAction::SwitchToMinify if allow_switch_to_minify => {
+            kill_prometheus_child(child);
+            progress(ProgressEvent::LongScriptDecision {
+                script_path: script_path.to_owned(),
+                action,
+                message: format!("Switching {script_path} to Prometheus Minify"),
+            });
+            Ok(Some(PrometheusProcessOutcome::SwitchToMinify))
+        }
+        LongScriptAction::SwitchToMinify => {
+            progress(ProgressEvent::LongScriptDecision {
+                script_path: script_path.to_owned(),
+                action: LongScriptAction::KeepWaiting,
+                message: "Minify is already active; continuing current run".to_owned(),
+            });
+            Ok(None)
+        }
+        LongScriptAction::Skip => {
+            kill_prometheus_child(child);
+            let reason = if preset == "Minify" {
+                "Minify also exceeded the long-script timeout; skipped source unchanged".to_owned()
+            } else {
+                "Skipped by long-script timeout control; source left unchanged".to_owned()
+            };
+            progress(ProgressEvent::LongScriptDecision {
+                script_path: script_path.to_owned(),
+                action,
+                message: reason.clone(),
+            });
+            Ok(Some(PrometheusProcessOutcome::Skip(reason)))
+        }
+    }
+}
+
+fn kill_prometheus_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn long_script_prompt_message(
+    script_path: &str,
+    preset: &str,
+    can_minify: bool,
+    phase: LongScriptPhase,
+) -> String {
+    match phase {
+        LongScriptPhase::Prompt if can_minify => format!(
+            "{script_path} is still running on {preset}. Enter = skip, m = Minify, k = stay on current preset."
+        ),
+        LongScriptPhase::Prompt => format!(
+            "{script_path} is still running on {preset}. Enter = skip, k = keep waiting."
+        ),
+        LongScriptPhase::MinifyPrompt => format!(
+            "{script_path} is still running on Minify. Enter = skip, k = keep waiting."
+        ),
+        LongScriptPhase::AutoSwitchToMinify => format!(
+            "{script_path} exceeded 30s on {preset}; switching to Minify unless forced to stay."
+        ),
+        LongScriptPhase::AutoSkip => format!(
+            "{script_path} exceeded 30s on Minify; skipping unless forced to stay."
+        ),
+    }
+}
+
+#[cfg(test)]
 fn prometheus_args_for(
     level: ObfuscationLevel,
     output_file: &Path,
     input_file: &Path,
 ) -> Vec<OsString> {
+    prometheus_args_for_preset(prometheus_preset_for_level(level), output_file, input_file)
+}
+
+fn prometheus_args_for_preset(
+    preset: &str,
+    output_file: &Path,
+    input_file: &Path,
+) -> Vec<OsString> {
     vec![
         OsString::from("--preset"),
-        OsString::from(prometheus_preset_for_level(level)),
+        OsString::from(preset),
         OsString::from("--LuaU"),
         OsString::from("--out"),
         output_file.as_os_str().to_owned(),
@@ -2502,6 +2968,19 @@ mod tests {
                 OsString::from("input.luau"),
             ]
         );
+    }
+
+
+    #[test]
+    fn prometheus_minify_command_args_use_minify_preset() {
+        let args = prometheus_args_for_preset(
+            "Minify",
+            Path::new("output.luau"),
+            Path::new("input.luau"),
+        );
+
+        assert_eq!(args[1], OsString::from("Minify"));
+        assert!(args.contains(&OsString::from("--saveerrors")));
     }
 
     #[test]

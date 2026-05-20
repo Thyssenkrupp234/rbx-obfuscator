@@ -27,7 +27,8 @@ use ratatui::{
 use rbxl_obfuscate::{
     default_output_path,
     extract::{ExtractOptions, ExtractSummary},
-    ObfuscationLevel, ObfuscationSummary, Options, ProgressEvent,
+    LongScriptAction, LongScriptContext, LongScriptPhase, ObfuscationLevel, ObfuscationSummary,
+    Options, ProgressEvent,
 };
 
 const APP_TITLE: &str = "rbx-obfuscator v1.0";
@@ -290,6 +291,7 @@ fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<(
     let started_at = Instant::now();
     let mut progress_state = ProgressUiState::new(state.mode);
     let (sender, receiver) = mpsc::channel();
+    let (script_action_sender, script_action_receiver) = mpsc::channel();
     let cancel_requested = Arc::new(AtomicBool::new(false));
 
     match state.mode {
@@ -297,7 +299,8 @@ fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<(
             let level = state.selected_level();
             let worker_cancel = Arc::clone(&cancel_requested);
             thread::spawn(move || {
-                let result = rbxl_obfuscate::run_with_progress_controlled(
+                let mut long_script_control = WorkerLongScriptControl::default();
+                let result = rbxl_obfuscate::run_with_progress_controlled_and_script_actions(
                     Options {
                         input,
                         output: Some(output),
@@ -310,6 +313,7 @@ fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<(
                         manifest: None,
                     },
                     || worker_cancel.load(Ordering::SeqCst),
+                    |context| long_script_control.next_action(context, &script_action_receiver),
                     |event| {
                         let _ = sender.send(WorkerMessage::Progress(event));
                     },
@@ -352,9 +356,28 @@ fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<(
             let Event::Key(key) = event::read()? else {
                 continue;
             };
-            if key.kind == KeyEventKind::Press
-                && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-            {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if progress_state.long_script_prompt_active {
+                match key.code {
+                    KeyCode::Enter => {
+                        let _ = script_action_sender.send(LongScriptAction::Skip);
+                        progress_state.notice = "Skip requested for the current long-running script.".to_owned();
+                    }
+                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                        let _ = script_action_sender.send(LongScriptAction::SwitchToMinify);
+                        progress_state.notice = "Minify requested for the current long-running script.".to_owned();
+                    }
+                    KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Char('s') | KeyCode::Char('S') => {
+                        let _ = script_action_sender.send(LongScriptAction::KeepWaiting);
+                        progress_state.notice = "Stay-current requested for this long-running script.".to_owned();
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                 cancel_requested.store(true, Ordering::SeqCst);
                 progress_state.notice =
                     "Cancel requested; waiting for the current operation to stop cleanly."
@@ -386,6 +409,55 @@ fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<(
 enum WorkerMessage {
     Progress(ProgressEvent),
     Finished(std::result::Result<WizardResult, String>),
+}
+
+#[derive(Default)]
+struct WorkerLongScriptControl {
+    active_script: Option<String>,
+    stay_on_current_preset: bool,
+    stay_on_minify: bool,
+}
+
+impl WorkerLongScriptControl {
+    fn next_action(
+        &mut self,
+        context: LongScriptContext,
+        receiver: &mpsc::Receiver<LongScriptAction>,
+    ) -> Option<LongScriptAction> {
+        if self.active_script.as_deref() != Some(context.script_path.as_str()) {
+            self.active_script = Some(context.script_path.clone());
+            self.stay_on_current_preset = false;
+            self.stay_on_minify = false;
+            while receiver.try_recv().is_ok() {}
+        }
+
+        let mut requested = None;
+        while let Ok(action) = receiver.try_recv() {
+            requested = Some(action);
+        }
+
+        match requested {
+            Some(LongScriptAction::KeepWaiting) => {
+                match context.phase {
+                    LongScriptPhase::Prompt | LongScriptPhase::AutoSwitchToMinify => {
+                        self.stay_on_current_preset = true;
+                    }
+                    LongScriptPhase::MinifyPrompt | LongScriptPhase::AutoSkip => {
+                        self.stay_on_minify = true;
+                    }
+                }
+                Some(LongScriptAction::KeepWaiting)
+            }
+            Some(action) => Some(action),
+            None => match context.phase {
+                LongScriptPhase::AutoSwitchToMinify if self.stay_on_current_preset => {
+                    Some(LongScriptAction::KeepWaiting)
+                }
+                LongScriptPhase::AutoSkip if self.stay_on_minify => Some(LongScriptAction::KeepWaiting),
+                _ => None,
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -433,6 +505,8 @@ struct ProgressUiState {
     scripts_total: usize,
     eta: Option<u64>,
     notice: String,
+    long_script_prompt_active: bool,
+    long_script_can_minify: bool,
 }
 
 impl ProgressUiState {
@@ -472,6 +546,8 @@ impl ProgressUiState {
             scripts_total: 0,
             eta: None,
             notice: String::new(),
+            long_script_prompt_active: false,
+            long_script_can_minify: false,
         }
     }
 
@@ -496,7 +572,13 @@ impl ProgressUiState {
                     *completion = 1.0;
                 }
             }
-            ProgressEvent::CurrentItem { value, .. } => self.current_thing = value,
+            ProgressEvent::CurrentItem { value, .. } => {
+                if self.current_thing != value {
+                    self.long_script_prompt_active = false;
+                    self.long_script_can_minify = false;
+                }
+                self.current_thing = value;
+            }
             ProgressEvent::ScriptProgress {
                 completed,
                 total,
@@ -516,7 +598,30 @@ impl ProgressUiState {
             }
             ProgressEvent::CompatibilityNote { message } => self.compatibility = message,
             ProgressEvent::EtaUpdated { seconds_remaining } => self.eta = seconds_remaining,
-            ProgressEvent::Warning { message } => self.notice = message,
+            ProgressEvent::LongScriptPrompt {
+                message,
+                can_minify,
+                ..
+            } => {
+                self.long_script_prompt_active = true;
+                self.long_script_can_minify = can_minify;
+                self.notice = message;
+            }
+            ProgressEvent::LongScriptDecision { message, action, .. } => {
+                self.notice = message;
+                if matches!(
+                    action,
+                    LongScriptAction::Skip | LongScriptAction::SwitchToMinify
+                ) {
+                    self.long_script_prompt_active = false;
+                    self.long_script_can_minify = false;
+                }
+            }
+            ProgressEvent::Warning { message } => {
+                self.long_script_prompt_active = false;
+                self.long_script_can_minify = false;
+                self.notice = message;
+            }
             ProgressEvent::Finished => {}
         }
     }
@@ -749,12 +854,34 @@ fn render_progress(frame: &mut Frame<'_>, state: &ProgressUiState) {
         chunks[3],
     );
 
-    let notice = if state.notice.is_empty() {
-        "Press q to cancel | Logs: hidden | Mode: interactive"
+    if state.long_script_prompt_active {
+        if state.long_script_can_minify {
+            render_footer(
+                frame,
+                chunks[4],
+                &[
+                    state.notice.as_str(),
+                    "Enter = skip script | m = use Minify | k = force stay | q = cancel",
+                ],
+            );
+        } else {
+            render_footer(
+                frame,
+                chunks[4],
+                &[
+                    state.notice.as_str(),
+                    "Enter = skip script | k = force stay | q = cancel",
+                ],
+            );
+        }
     } else {
-        state.notice.as_str()
-    };
-    render_footer(frame, chunks[4], &[notice]);
+        let notice = if state.notice.is_empty() {
+            "Press q to cancel | Logs: hidden | Mode: interactive"
+        } else {
+            state.notice.as_str()
+        };
+        render_footer(frame, chunks[4], &[notice]);
+    }
 }
 
 fn render_complete(frame: &mut Frame<'_>, state: &CompletionState) {

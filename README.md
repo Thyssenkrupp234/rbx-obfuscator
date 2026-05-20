@@ -151,6 +151,8 @@ Prometheus can fail on some Luau type syntax, such as `local Bus:ObjectValue = s
 
 If Prometheus still fails to process a script, that script is left unchanged in the output file. The run continues, and all failed script paths are printed at the end.
 
+Long-running scripts are guarded so one huge ModuleScript does not stall the whole run forever. After a script has been running for 10 seconds in the interactive wizard, the footer shows controls: press Enter to skip that script, `m` to restart that script with the Prometheus `Minify` preset, or `k`/`s` to force the current preset to keep running. If the script reaches 30 seconds without a bypass, the tool automatically switches that script to `Minify`; if `Minify` also runs for 30 seconds without a bypass, the script is skipped unchanged. Direct CLI mode uses the same automatic Minify-then-skip behavior without keyboard prompts.
+
 Prometheus preset mapping:
 
 - `minimal`: `Weak`
