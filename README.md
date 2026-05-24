@@ -100,7 +100,7 @@ rbx-obfuscator obfuscate <input.rbxl|input.rbxm|input.rbxlx|input.rbxmx> --level
 
 Obfuscation options:
 
-- `--level <minimal|low|medium|high>`: required obfuscation complexity. Maps to a Prometheus preset.
+- `--level <minimal|low|medium|high>`: required obfuscation complexity. Values are case-insensitive, so `High` and `Medium` work too. Maps to a Prometheus preset.
 - `--output <path>`, `-o <path>`: optional output `.rbxl`, `.rbxm`, `.rbxlx`, or `.rbxmx` path. Defaults to `<input-stem>-obfuscated_<Level>.<extension>`.
 - `--dry-run`: reports scripts that would be processed and the Prometheus preset that would be used, without running Prometheus or writing output.
 - `--strip-types`: removes Luau type annotations and lowers known Prometheus-incompatible Luau syntax before every Prometheus run.

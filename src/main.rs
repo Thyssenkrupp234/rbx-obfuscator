@@ -38,7 +38,7 @@ impl From<CliObfuscationLevel> for rbxl_obfuscate::ObfuscationLevel {
     version,
     about = "Obfuscate Roblox files or extract readable project components",
     long_about = "Run without a command to open the interactive wizard.\n\nUse `rbx-obfuscator obfuscate` for Prometheus obfuscation.\nUse `rbx-obfuscator extract` for component extraction.",
-    after_help = "Examples:\n  rbx-obfuscator\n  rbx-obfuscator obfuscate /path/to/game.rbxl --level high --output ~/game-obfuscated.rbxl\n  rbx-obfuscator extract /path/to/game.rbxl\n  rbx-obfuscator extract /path/to/game.rbxl ./game-components\n  rbx-obfuscator update"
+    after_help = "Obfuscation flags:\n  --level <minimal|low|medium|high>    Required for `obfuscate`; values are case-insensitive\n  --output <path>                      Optional output file; defaults next to the input\n\nExamples:\n  rbx-obfuscator\n  rbx-obfuscator obfuscate /path/to/game.rbxl --level high --output ~/game-obfuscated.rbxl\n  rbx-obfuscator extract /path/to/game.rbxl\n  rbx-obfuscator extract /path/to/game.rbxl ./game-components\n  rbx-obfuscator update"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,19 +61,19 @@ enum CliCommand {
 #[command(
     name = "rbx-obfuscator obfuscate",
     about = "Obfuscate Roblox script sources with Prometheus",
-    after_help = "Example:\n  rbx-obfuscator obfuscate /Users/lincolnmuller/Documents/train\\ game.rbxl --level high --output ~/train_game_obfuscated_high.rbxl"
+    after_help = "Required:\n  --level <minimal|low|medium|high>    Obfuscation level; values are case-insensitive\n\nOptional:\n  --output <path>                      Output file; defaults to <input-stem>-obfuscated_<Level>.<extension>\n\nExample:\n  rbx-obfuscator obfuscate /Users/lincolnmuller/Documents/train\\ game.rbxl --level high --output ~/train_game_obfuscated_high.rbxl"
 )]
 struct ObfuscateCli {
     /// Input .rbxl, .rbxm, .rbxlx, or .rbxmx file to obfuscate.
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 
-    /// Output file. Defaults to <input-stem>-obfuscated_<Level>.<extension>.
+    /// Optional output file. Defaults to <input-stem>-obfuscated_<Level>.<extension>.
     #[arg(short, long, value_name = "OUTPUT")]
     output: Option<PathBuf>,
 
-    /// Built-in obfuscation level to map to a Prometheus preset.
-    #[arg(long, value_enum, value_name = "LEVEL")]
+    /// Required obfuscation level. Values are case-insensitive: minimal, low, medium, high.
+    #[arg(long, value_enum, ignore_case = true, value_name = "LEVEL")]
     level: CliObfuscationLevel,
 
     /// Report what would be processed without running Prometheus or writing output.
@@ -285,6 +285,39 @@ mod tests {
         };
 
         assert_eq!(cli.output, Some(PathBuf::from("output.rbxl")));
+    }
+
+    #[test]
+    fn obfuscate_level_accepts_mixed_case_values() {
+        let AppMode::Obfuscate(high_cli) = parse_app_mode(
+            [
+                "rbx-obfuscator",
+                "obfuscate",
+                "input.rbxl",
+                "--level",
+                "High",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected obfuscation mode");
+        };
+        let AppMode::Obfuscate(medium_cli) = parse_app_mode(
+            [
+                "rbx-obfuscator",
+                "obfuscate",
+                "input.rbxl",
+                "--level",
+                "Medium",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected obfuscation mode");
+        };
+
+        assert_eq!(high_cli.level, CliObfuscationLevel::High);
+        assert_eq!(medium_cli.level, CliObfuscationLevel::Medium);
     }
 
     #[test]
