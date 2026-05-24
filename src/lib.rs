@@ -328,7 +328,7 @@ where
     };
     let output_format = validate_input_format(&output)?;
     validate_options(&options, &output)?;
-    let prometheus_path = resolve_or_install_prometheus(options.dry_run)?;
+    let prometheus_path = resolve_or_install_prometheus(options.dry_run, &mut progress)?;
     let prometheus_preset = prometheus_preset_for_level(options.obfuscation_level);
 
     progress(ProgressEvent::StageStarted {
@@ -858,24 +858,35 @@ impl PrometheusRuntime for SystemPrometheusRuntime {
     }
 }
 
-fn resolve_or_install_prometheus(dry_run: bool) -> Result<PathBuf> {
+fn resolve_or_install_prometheus<F>(dry_run: bool, progress: &mut F) -> Result<PathBuf>
+where
+    F: FnMut(ProgressEvent),
+{
     let state_file = prometheus_update_state_file();
     let mut runtime = SystemPrometheusRuntime;
-    resolve_or_install_prometheus_with(dry_run, state_file.as_deref(), &mut runtime)
+    resolve_or_install_prometheus_with(dry_run, state_file.as_deref(), &mut runtime, |message| {
+        progress(ProgressEvent::Warning { message })
+    })
 }
 
-fn resolve_or_install_prometheus_with(
+fn resolve_or_install_prometheus_with<R>(
     dry_run: bool,
     state_file: Option<&Path>,
     runtime: &mut impl PrometheusRuntime,
-) -> Result<PathBuf> {
+    mut report: R,
+) -> Result<PathBuf>
+where
+    R: FnMut(String),
+{
     let prometheus_path = PathBuf::from(PROMETHEUS_COMMAND);
     if dry_run {
         return Ok(prometheus_path);
     }
 
     if !runtime.prometheus_available()? {
-        eprintln!("{PROMETHEUS_COMMAND} not found on PATH; installing Prometheus");
+        report(format!(
+            "{PROMETHEUS_COMMAND} not found on PATH; installing Prometheus"
+        ));
         runtime.install_prometheus().with_context(|| {
             format!(
                 "failed to install Prometheus with `{PROMETHEUS_INSTALL_COMMAND}`. Install curl and rerun, or install {PROMETHEUS_COMMAND} on PATH"
@@ -890,29 +901,33 @@ fn resolve_or_install_prometheus_with(
         return Ok(prometheus_path);
     }
 
-    maybe_update_prometheus(state_file, runtime)?;
+    maybe_update_prometheus(state_file, runtime, &mut report)?;
     Ok(prometheus_path)
 }
 
-fn maybe_update_prometheus(
+fn maybe_update_prometheus<R>(
     state_file: Option<&Path>,
     runtime: &mut impl PrometheusRuntime,
-) -> Result<()> {
+    report: &mut R,
+) -> Result<()>
+where
+    R: FnMut(String),
+{
     if !prometheus_update_is_stale(state_file, runtime.now())? {
         return Ok(());
     }
 
     if !runtime.internet_available() {
-        eprintln!("Prometheus update check skipped; no internet connection detected");
+        report("Prometheus update check skipped; no internet connection detected".to_owned());
         return Ok(());
     }
 
-    eprintln!("Updating Prometheus installation");
+    report("Updating Prometheus installation".to_owned());
     if let Err(update_error) = runtime.update_prometheus() {
-        eprintln!(
+        report(format!(
             "{PROMETHEUS_COMMAND} update failed; retrying with installer: {}",
             first_error_line(&format!("{update_error:#}"))
-        );
+        ));
         runtime.install_prometheus().with_context(|| {
             format!(
                 "failed to update Prometheus with `{PROMETHEUS_COMMAND} update` or `{PROMETHEUS_INSTALL_COMMAND}`"
@@ -2785,6 +2800,14 @@ mod tests {
         fixed_now() - PROMETHEUS_UPDATE_INTERVAL - Duration::from_secs(1)
     }
 
+    fn resolve_prometheus_for_test(
+        dry_run: bool,
+        state_file: Option<&Path>,
+        runtime: &mut FakePrometheusRuntime,
+    ) -> Result<PathBuf> {
+        resolve_or_install_prometheus_with(dry_run, state_file, runtime, |_| {})
+    }
+
     #[test]
     fn script_class_filter_is_exact() {
         assert!(is_script_class("Script"));
@@ -3136,7 +3159,7 @@ local plain = `hello`
             ..Default::default()
         };
 
-        let path = resolve_or_install_prometheus_with(true, None, &mut runtime).unwrap();
+        let path = resolve_prometheus_for_test(true, None, &mut runtime).unwrap();
 
         assert_eq!(path, PathBuf::from(PROMETHEUS_COMMAND));
         assert_eq!(runtime.availability_checks, 0);
@@ -3153,8 +3176,7 @@ local plain = `hello`
             ..Default::default()
         };
 
-        let resolved =
-            resolve_or_install_prometheus_with(false, Some(&state_file), &mut runtime).unwrap();
+        let resolved = resolve_prometheus_for_test(false, Some(&state_file), &mut runtime).unwrap();
 
         assert_eq!(resolved, PathBuf::from(PROMETHEUS_COMMAND));
         assert_eq!(runtime.install_calls, 1);
@@ -3173,7 +3195,7 @@ local plain = `hello`
             ..Default::default()
         };
 
-        let error = resolve_or_install_prometheus_with(false, None, &mut runtime).unwrap_err();
+        let error = resolve_prometheus_for_test(false, None, &mut runtime).unwrap_err();
         let error = format!("{error:#}");
 
         assert!(error.contains("failed to install Prometheus"));
@@ -3187,7 +3209,7 @@ local plain = `hello`
         write_prometheus_update_timestamp(Some(&state_file), fixed_now()).unwrap();
         let mut runtime = FakePrometheusRuntime::default();
 
-        resolve_or_install_prometheus_with(false, Some(&state_file), &mut runtime).unwrap();
+        resolve_prometheus_for_test(false, Some(&state_file), &mut runtime).unwrap();
 
         assert_eq!(runtime.internet_checks, 0);
         assert_eq!(runtime.update_calls, 0);
@@ -3204,7 +3226,7 @@ local plain = `hello`
             ..Default::default()
         };
 
-        resolve_or_install_prometheus_with(false, Some(&state_file), &mut runtime).unwrap();
+        resolve_prometheus_for_test(false, Some(&state_file), &mut runtime).unwrap();
 
         assert_eq!(runtime.internet_checks, 1);
         assert_eq!(runtime.update_calls, 0);
@@ -3218,7 +3240,7 @@ local plain = `hello`
         write_prometheus_update_timestamp(Some(&state_file), stale_time()).unwrap();
         let mut runtime = FakePrometheusRuntime::default();
 
-        resolve_or_install_prometheus_with(false, Some(&state_file), &mut runtime).unwrap();
+        resolve_prometheus_for_test(false, Some(&state_file), &mut runtime).unwrap();
 
         assert_eq!(runtime.internet_checks, 1);
         assert_eq!(runtime.update_calls, 1);
@@ -3239,7 +3261,7 @@ local plain = `hello`
             ..Default::default()
         };
 
-        resolve_or_install_prometheus_with(false, Some(&state_file), &mut runtime).unwrap();
+        resolve_prometheus_for_test(false, Some(&state_file), &mut runtime).unwrap();
 
         assert_eq!(runtime.update_calls, 1);
         assert_eq!(runtime.install_calls, 1);

@@ -85,6 +85,24 @@ pub fn run_wizard() -> Result<()> {
     run_operation(&mut terminal, state)
 }
 
+pub fn run_obfuscation(options: Options) -> Result<()> {
+    let mut terminal = TerminalSession::enter()?;
+    run_operation_request(
+        &mut terminal,
+        OperationRequest::Obfuscate(options),
+        CompletionExit::After(Duration::from_secs(1)),
+    )
+}
+
+pub fn run_extraction(options: ExtractOptions) -> Result<()> {
+    let mut terminal = TerminalSession::enter()?;
+    run_operation_request(
+        &mut terminal,
+        OperationRequest::Extract(options),
+        CompletionExit::After(Duration::from_secs(1)),
+    )
+}
+
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -137,6 +155,27 @@ enum WizardAction {
     Continue,
     Run,
     Quit,
+}
+
+#[derive(Debug)]
+enum OperationRequest {
+    Obfuscate(Options),
+    Extract(ExtractOptions),
+}
+
+impl OperationRequest {
+    fn mode(&self) -> WizardMode {
+        match self {
+            Self::Obfuscate(_) => WizardMode::Obfuscate,
+            Self::Extract(_) => WizardMode::Extract,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionExit {
+    WaitForInput,
+    After(Duration),
 }
 
 #[derive(Debug)]
@@ -288,30 +327,46 @@ fn handle_home_key(state: &mut WizardState, code: KeyCode) -> Result<WizardActio
 fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<()> {
     let input = PathBuf::from(clean_path_input(&state.input));
     let output = PathBuf::from(clean_path_input(&state.output));
+    let operation = match state.mode {
+        WizardMode::Obfuscate => OperationRequest::Obfuscate(Options {
+            input,
+            output: Some(output),
+            obfuscation_level: state.selected_level(),
+            dry_run: false,
+            strip_types: false,
+            verbose: false,
+            backup_dir: None,
+            skip_paths: Vec::new(),
+            manifest: None,
+        }),
+        WizardMode::Extract => OperationRequest::Extract(ExtractOptions {
+            input,
+            output_folder: output,
+            verbose: false,
+        }),
+    };
+
+    run_operation_request(terminal, operation, CompletionExit::WaitForInput)
+}
+
+fn run_operation_request(
+    terminal: &mut TerminalSession,
+    operation: OperationRequest,
+    completion_exit: CompletionExit,
+) -> Result<()> {
     let started_at = Instant::now();
-    let mut progress_state = ProgressUiState::new(state.mode);
+    let mut progress_state = ProgressUiState::new(operation.mode());
     let (sender, receiver) = mpsc::channel();
     let (script_action_sender, script_action_receiver) = mpsc::channel();
     let cancel_requested = Arc::new(AtomicBool::new(false));
 
-    match state.mode {
-        WizardMode::Obfuscate => {
-            let level = state.selected_level();
+    match operation {
+        OperationRequest::Obfuscate(options) => {
             let worker_cancel = Arc::clone(&cancel_requested);
             thread::spawn(move || {
                 let mut long_script_control = WorkerLongScriptControl::default();
                 let result = rbxl_obfuscate::run_with_progress_controlled_and_script_actions(
-                    Options {
-                        input,
-                        output: Some(output),
-                        obfuscation_level: level,
-                        dry_run: false,
-                        strip_types: false,
-                        verbose: false,
-                        backup_dir: None,
-                        skip_paths: Vec::new(),
-                        manifest: None,
-                    },
+                    options,
                     || worker_cancel.load(Ordering::SeqCst),
                     |context| long_script_control.next_action(context, &script_action_receiver),
                     |event| {
@@ -323,15 +378,11 @@ fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<(
                 let _ = sender.send(WorkerMessage::Finished(result));
             });
         }
-        WizardMode::Extract => {
+        OperationRequest::Extract(options) => {
             let worker_cancel = Arc::clone(&cancel_requested);
             thread::spawn(move || {
                 let result = rbxl_obfuscate::extract::run_with_progress_controlled(
-                    ExtractOptions {
-                        input,
-                        output_folder: output,
-                        verbose: false,
-                    },
+                    options,
                     || worker_cancel.load(Ordering::SeqCst),
                     |event| {
                         let _ = sender.send(WorkerMessage::Progress(event));
@@ -393,20 +444,27 @@ fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<(
     };
 
     let completion = CompletionState::from_result(result, started_at.elapsed())?;
-    loop {
-        terminal.draw(|frame| render_complete(frame, &completion))?;
-        if event::poll(Duration::from_millis(100))? {
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
+    match completion_exit {
+        CompletionExit::WaitForInput => loop {
+            terminal.draw(|frame| render_complete(frame, &completion))?;
+            if event::poll(Duration::from_millis(100))? {
+                let Event::Key(key) = event::read()? else {
+                    continue;
+                };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('c') => {}
+                    _ => {}
+                }
             }
-            match key.code {
-                KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Char('c') => {}
-                _ => {}
-            }
+        },
+        CompletionExit::After(duration) => {
+            terminal.draw(|frame| render_complete(frame, &completion))?;
+            thread::sleep(duration);
+            Ok(())
         }
     }
 }
@@ -699,10 +757,10 @@ impl CompletionState {
                     "Not requested".to_owned()
                 }),
                 command: format!(
-                    "rbx-obfuscator \\\n  \"{}\" \\\n  \"{}\" \\\n  --level {}",
-                    display_path(&summary.input),
-                    display_path(&summary.output),
-                    summary.obfuscation_level.as_str()
+                    "rbx-obfuscator obfuscate \\\n  {} \\\n  --level {} \\\n  --output {}",
+                    shell_quote_path(&summary.input),
+                    summary.obfuscation_level.as_str(),
+                    shell_quote_path(&summary.output)
                 ),
             }),
             Ok(WizardResult::Extraction(summary)) => Ok(Self {
@@ -721,9 +779,9 @@ impl CompletionState {
                 duration,
                 backup: None,
                 command: format!(
-                    "rbx-obfuscator extract \\\n  \"{}\" \\\n  \"{}\"",
-                    display_path(&summary.input),
-                    display_path(&summary.output_folder)
+                    "rbx-obfuscator extract \\\n  {} \\\n  {}",
+                    shell_quote_path(&summary.input),
+                    shell_quote_path(&summary.output_folder)
                 ),
             }),
             Err(error) => bail!(error),
@@ -1394,6 +1452,21 @@ fn display_path(path: &std::path::Path) -> String {
     path
 }
 
+fn shell_quote_path(path: &std::path::Path) -> String {
+    shell_quote(&path.display().to_string())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+    {
+        return value.to_owned();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn format_seconds(seconds: u64) -> String {
     let minutes = seconds / 60;
     let seconds = seconds % 60;
@@ -1515,7 +1588,7 @@ mod tests {
             content_refs_line: None,
             duration: Duration::from_secs(462),
             backup: Some("Created".to_owned()),
-            command: "rbx-obfuscator \\\n  \"input.rbxl\" \\\n  \"output.rbxl\" \\\n  --level high"
+            command: "rbx-obfuscator obfuscate \\\n  input.rbxl \\\n  --level high \\\n  --output output.rbxl"
                 .to_owned(),
         };
 
@@ -1540,7 +1613,7 @@ mod tests {
             content_refs_line: None,
             duration: Duration::from_secs(8),
             backup: Some("Not requested".to_owned()),
-            command: "rbx-obfuscator \\\n  \"~/Documents/train game.rbxl\" \\\n  \"~/Documents/train game-obfuscated_High.rbxl\" \\\n  --level high"
+            command: "rbx-obfuscator obfuscate \\\n  '/Users/lincolnmuller/Documents/train game.rbxl' \\\n  --level high \\\n  --output '/Users/lincolnmuller/Documents/train game-obfuscated_High.rbxl'"
                 .to_owned(),
         };
 
@@ -1551,6 +1624,16 @@ mod tests {
 
         assert!(text.contains("rbx-obfuscator"));
         assert!(!text.contains("copy command unavailable"));
+    }
+
+    #[test]
+    fn shell_quote_path_keeps_completion_commands_pasteable() {
+        assert_eq!(shell_quote("plain/path.rbxl"), "plain/path.rbxl");
+        assert_eq!(
+            shell_quote("/Users/example/train game.rbxl"),
+            "'/Users/example/train game.rbxl'"
+        );
+        assert_eq!(shell_quote("Bob's.rbxl"), "'Bob'\\''s.rbxl'");
     }
 
     #[test]

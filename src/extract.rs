@@ -122,6 +122,13 @@ where
     run_with_progress_controlled(options, || false, progress)
 }
 
+pub fn default_output_folder(input: &Path) -> Result<PathBuf> {
+    let stem = input
+        .file_stem()
+        .ok_or_else(|| anyhow!("input path has no file name: {}", input.display()))?;
+    Ok(input.with_file_name(stem))
+}
+
 pub fn run_with_progress_controlled<C, F>(
     options: ExtractOptions,
     mut should_cancel: C,
@@ -768,6 +775,18 @@ mod tests {
 
         assert!(format!("{error:#}").contains("must not overwrite input"));
         assert!(validate_extract_output(&input, &output).is_ok());
+    }
+
+    #[test]
+    fn default_output_folder_uses_input_stem_next_to_input() {
+        assert_eq!(
+            default_output_folder(Path::new("/tmp/train game.rbxl")).unwrap(),
+            PathBuf::from("/tmp/train game")
+        );
+        assert_eq!(
+            default_output_folder(Path::new("Model.rbxm")).unwrap(),
+            PathBuf::from("Model")
+        );
     }
 
     #[test]

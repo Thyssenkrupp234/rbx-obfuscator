@@ -56,18 +56,28 @@ Dry-run mode does not install, update, or launch Prometheus.
 
 ## Usage
 
-Run with no arguments to open the interactive terminal wizard:
+There are three direct commands:
+
+- `rbx-obfuscator obfuscate`: obfuscates scripts inside a Roblox file.
+- `rbx-obfuscator extract`: exports readable components from a Roblox file.
+- `rbx-obfuscator update`: updates the installed CLI and managed dependencies.
+
+Running `rbx-obfuscator` with no command always opens the interactive terminal wizard:
 
 ```bash
 rbx-obfuscator
 ```
 
-The wizard lets you choose full obfuscation or component extraction, paste paths, pick the Prometheus level, watch clean progress, and see the equivalent direct command on the completion screen.
+The wizard lets you choose full obfuscation or component extraction, paste paths, pick the Prometheus level, watch clean progress, and see the equivalent direct command on the completion screen. Direct commands skip the setup wizard and go straight to the progress screen.
+
+### Obfuscate
+
+Obfuscation must be run through the `obfuscate` command. The input file and `--level` are required.
 
 Obfuscate a place file and write the default output next to the input:
 
 ```bash
-rbx-obfuscator game.rbxl --level medium
+rbx-obfuscator obfuscate game.rbxl --level medium
 ```
 
 For `game.rbxl`, that writes:
@@ -76,40 +86,22 @@ For `game.rbxl`, that writes:
 game-obfuscated_Medium.rbxl
 ```
 
-Obfuscate a model file with an explicit output path:
+Obfuscate a file with an explicit output path:
 
 ```bash
-rbx-obfuscator input.rbxm --level high --output output.rbxm
+rbx-obfuscator obfuscate /Users/lincolnmuller/Documents/train\ game.rbxl --level high --output ~/train_game_obfuscated_high.rbxl
 ```
 
-The compatibility positional output form is also supported:
+Obfuscation syntax:
 
 ```bash
-rbx-obfuscator input.rbxl output.rbxl --level high
-```
-
-You can use the explicit subcommand form if you prefer:
-
-```bash
-rbx-obfuscator obfuscate input.rbxl output.rbxl --level high
-```
-
-Extract components without obfuscating:
-
-```bash
-rbx-obfuscator extract Ro-TransLink.rbxl ./Ro-TransLink-extracted
-```
-
-Update the CLI and managed dependencies:
-
-```bash
-rbx-obfuscator update
+rbx-obfuscator obfuscate <input.rbxl|input.rbxm|input.rbxlx|input.rbxmx> --level <minimal|low|medium|high> [--output <output-file>]
 ```
 
 Obfuscation options:
 
 - `--level <minimal|low|medium|high>`: required obfuscation complexity. Maps to a Prometheus preset.
-- `--output <path>`, `-o <path>`: output `.rbxl`, `.rbxm`, `.rbxlx`, or `.rbxmx` path. Defaults to `<input-stem>-obfuscated_<Level>.<extension>`.
+- `--output <path>`, `-o <path>`: optional output `.rbxl`, `.rbxm`, `.rbxlx`, or `.rbxmx` path. Defaults to `<input-stem>-obfuscated_<Level>.<extension>`.
 - `--dry-run`: reports scripts that would be processed and the Prometheus preset that would be used, without running Prometheus or writing output.
 - `--strip-types`: removes Luau type annotations and lowers known Prometheus-incompatible Luau syntax before every Prometheus run.
 - `--backup-dir <dir>`: writes original script sources as `.luau` files before replacement.
@@ -117,10 +109,43 @@ Obfuscation options:
 - `--manifest <path>`: writes a JSON report of processed, skipped, failed, or dry-run scripts, including whether Luau compatibility preprocessing was applied.
 - `--verbose`, `-v`: shows detailed per-script and Prometheus logs. Normal output stays compact.
 
-Commands:
+### Extract
 
-- `extract <input> <output-folder>`: exports scripts, GUI JSON, the instance tree, content references, and `manifest.json`.
-- `update`: downloads the latest installer from GitHub, updates the source checkout, rebuilds the CLI, reinstalls it, and updates Prometheus. Pass `--verbose` after `update` to show installer output.
+Extraction must be run through the `extract` command. The only required argument is the input Roblox file.
+
+```bash
+rbx-obfuscator extract /Users/lincolnmuller/Documents/train\ game.rbxl
+```
+
+When no output folder is given, extraction creates a sibling folder using the input file name without its extension. The command above writes to:
+
+```text
+/Users/lincolnmuller/Documents/train game/
+```
+
+Use an explicit output folder when you want the extracted project somewhere else:
+
+```bash
+rbx-obfuscator extract /Users/lincolnmuller/Documents/train\ game.rbxl ~/train_game_components
+```
+
+Extraction syntax:
+
+```bash
+rbx-obfuscator extract <input.rbxl|input.rbxm|input.rbxlx|input.rbxmx> [output-folder]
+```
+
+Extraction exports scripts, GUI JSON, the instance tree, content references, and `manifest.json`.
+
+### Update
+
+Update the CLI and managed dependencies:
+
+```bash
+rbx-obfuscator update
+```
+
+`update` downloads the latest installer from GitHub, updates the source checkout, rebuilds the CLI, reinstalls it, and updates Prometheus. Pass `--verbose` after `update` to show installer output.
 
 The tool accepts `.rbxl`, `.rbxm`, `.rbxlx`, and `.rbxmx` inputs. It refuses to write the obfuscation output path when it resolves to the same file as the input, and extraction refuses to use the input file as the output folder.
 
@@ -160,6 +185,28 @@ Prometheus preset mapping:
 - `medium`: `Medium`
 - `high`: `Strong`
 
+## Local Development
+
+To test the working checkout without installing or updating the released CLI, run the binary through Cargo:
+
+```bash
+cargo run -- --help
+cargo run -- obfuscate /Users/lincolnmuller/Documents/train\ game.rbxl --level high --output /tmp/train_game_obfuscated_high.rbxl
+cargo run -- extract /Users/lincolnmuller/Documents/train\ game.rbxl /tmp/train_game_components
+```
+
+The `--` after `cargo run` separates Cargo's flags from `rbx-obfuscator`'s flags. This always uses the code in the current checkout.
+
+You can also build once and run the local debug binary directly:
+
+```bash
+cargo build
+./target/debug/rbx-obfuscator --help
+./target/debug/rbx-obfuscator obfuscate game.rbxl --level medium --dry-run
+```
+
+Use `cargo build --release` and `./target/release/rbx-obfuscator ...` when you want to test the optimized binary before installing it.
+
 ## Test Strategy
 
 Run unit tests:
@@ -174,7 +221,7 @@ Recommended local validation:
 cargo fmt -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-rbx-obfuscator game.rbxl --level medium --dry-run --manifest manifest.json
+cargo run -- obfuscate game.rbxl --level medium --dry-run --manifest manifest.json
 ```
 
 Then open `manifest.json` and confirm the expected scripts were processed or skipped. Keep `backups/` for comparing original sources when validating a release build.
