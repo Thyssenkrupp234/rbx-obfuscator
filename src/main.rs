@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 mod tui;
 
 const INSTALL_SCRIPT_URL: &str =
-    "https://raw.githubusercontent.com/Thyssenkrupp234/roblox-obfuscator/main/install.sh";
+    "https://raw.githubusercontent.com/Thyssenkrupp234/rbx-obfuscator/main/install.sh";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum CliObfuscationLevel {

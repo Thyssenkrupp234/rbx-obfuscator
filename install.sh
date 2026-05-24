@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO_URL="${RBX_OBFUSCATOR_REPO_URL:-https://github.com/Thyssenkrupp234/roblox-obfuscator.git}"
+REPO_URL="${RBX_OBFUSCATOR_REPO_URL:-https://github.com/Thyssenkrupp234/rbx-obfuscator.git}"
 BRANCH="${RBX_OBFUSCATOR_BRANCH:-main}"
 INSTALL_ROOT="${RBX_OBFUSCATOR_INSTALL_ROOT:-$HOME/.rbx-obfuscator}"
 SOURCE_DIR="$INSTALL_ROOT/source"

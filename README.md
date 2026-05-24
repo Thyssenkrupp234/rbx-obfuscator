@@ -9,13 +9,13 @@ It does not use Rojo and does not require Roblox Studio for the normal workflow.
 Install the latest version from GitHub:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Thyssenkrupp234/roblox-obfuscator/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Thyssenkrupp234/rbx-obfuscator/main/install.sh | sh
 ```
 
 The installer keeps normal output quiet and only shows one line per install step. To see the underlying `git`, Prometheus, and Cargo output, run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Thyssenkrupp234/roblox-obfuscator/main/install.sh | sh -s -- --verbose
+curl -fsSL https://raw.githubusercontent.com/Thyssenkrupp234/rbx-obfuscator/main/install.sh | sh -s -- --verbose
 ```
 
 The installer:
@@ -36,7 +36,7 @@ The one-line installer fetches `install.sh` from GitHub. If you already have a c
 Installer settings can be overridden with environment variables:
 
 ```bash
-RBX_OBFUSCATOR_REPO_URL=https://github.com/Thyssenkrupp234/roblox-obfuscator.git
+RBX_OBFUSCATOR_REPO_URL=https://github.com/Thyssenkrupp234/rbx-obfuscator.git
 RBX_OBFUSCATOR_BRANCH=main
 RBX_OBFUSCATOR_INSTALL_ROOT="$HOME/.rbx-obfuscator"
 RBX_OBFUSCATOR_BIN_DIR="$HOME/.local/bin"
