@@ -15,12 +15,16 @@ use rbx_dom_weak::{
     types::{Ref, Variant},
     ustr, WeakDom,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
+pub mod compile;
 pub mod extract;
 
 pub(crate) const SCRIPT_CLASSES: &[&str] = &["Script", "LocalScript", "ModuleScript"];
+pub(crate) const COMPILE_STATE_DIR: &str = ".rbx-obfuscator";
+pub(crate) const COMPILE_METADATA_FILE: &str = "compile.json";
+pub(crate) const COMPILE_BASELINE_INSTANCES_FILE: &str = "baseline_instances.json";
 const PROMETHEUS_COMMAND: &str = "prometheus-lua";
 const PROMETHEUS_INSTALL_URL: &str =
     "https://raw.githubusercontent.com/prometheus-lua/Prometheus/master/install.sh";
@@ -63,7 +67,7 @@ impl ObfuscationLevel {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RobloxFileFormat {
     Rbxl,
@@ -100,9 +104,36 @@ impl RobloxFileFormat {
         }
     }
 
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            Self::Rbxl => "rbxl",
+            Self::Rbxm => "rbxm",
+            Self::Rbxlx => "rbxlx",
+            Self::Rbxmx => "rbxmx",
+        }
+    }
+
     fn is_xml(self) -> bool {
         matches!(self, Self::Rbxlx | Self::Rbxmx)
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CompileMetadata {
+    pub version: u32,
+    pub input: PathBuf,
+    pub input_format: RobloxFileFormat,
+    pub original_snapshot: PathBuf,
+    pub baseline_instances: PathBuf,
+    pub scripts: Vec<CompileScriptEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CompileScriptEntry {
+    pub id: String,
+    pub roblox_path: String,
+    pub class_name: String,
+    pub source_file: Option<PathBuf>,
 }
 
 pub fn prometheus_preset_for_level(level: ObfuscationLevel) -> &'static str {

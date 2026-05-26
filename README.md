@@ -56,10 +56,11 @@ Dry-run mode does not install, update, or launch Prometheus.
 
 ## Usage
 
-There are three direct commands:
+There are four direct commands:
 
 - `rbx-obfuscator obfuscate`: obfuscates scripts inside a Roblox file.
 - `rbx-obfuscator extract`: exports readable components from a Roblox file.
+- `rbx-obfuscator compile`: rebuilds a compile-aware extracted project into a Roblox file.
 - `rbx-obfuscator update`: updates the installed CLI and managed dependencies.
 
 Running `rbx-obfuscator` with no command always opens the interactive terminal wizard:
@@ -68,7 +69,7 @@ Running `rbx-obfuscator` with no command always opens the interactive terminal w
 rbx-obfuscator
 ```
 
-The wizard lets you choose full obfuscation or component extraction, paste paths, pick the Prometheus level, watch clean progress, and see the equivalent direct command on the completion screen. Direct commands skip the setup wizard and go straight to the progress screen.
+The wizard lets you choose full obfuscation, component extraction, or project compilation, paste paths, pick the Prometheus level when needed, watch clean progress, and see the equivalent direct command on the completion screen. Direct commands skip the setup wizard and go straight to the progress screen.
 
 ### Obfuscate
 
@@ -135,7 +136,35 @@ Extraction syntax:
 rbx-obfuscator extract <input.rbxl|input.rbxm|input.rbxlx|input.rbxmx> [output-folder]
 ```
 
-Extraction exports scripts, GUI JSON, the instance tree, content references, and `manifest.json`.
+Extraction exports scripts, GUI JSON, the instance tree, content references, `manifest.json`, and hidden compile metadata used by `rbx-obfuscator compile`.
+
+### Compile
+
+Compilation rebuilds a project folder created by `rbx-obfuscator extract`:
+
+```bash
+rbx-obfuscator compile /Users/lincolnmuller/Documents/train\ game
+```
+
+When no output file is given, compile writes next to the original input path recorded during extraction:
+
+```text
+/Users/lincolnmuller/Documents/train game-compiled.rbxl
+```
+
+Use an explicit output file when you want the compiled Roblox file somewhere else:
+
+```bash
+rbx-obfuscator compile /Users/lincolnmuller/Documents/train\ game --output ~/train_game_compiled.rbxl
+```
+
+Compilation syntax:
+
+```bash
+rbx-obfuscator compile <extracted-folder> [output.rbxl|output.rbxm|output.rbxlx|output.rbxmx]
+```
+
+Compilation applies edited script files from `scripts/` and supported edits from `instances.json` to the full-fidelity original file preserved during extraction. In this version, `instances.json` can rename, reparent, reorder, and edit supported exported properties on existing instances. It rejects added instances, deleted instances, class changes, new properties, removed properties, unsupported property types, and script `Source` edits in JSON.
 
 ### Update
 
@@ -147,7 +176,7 @@ rbx-obfuscator update
 
 `update` downloads the latest installer from GitHub, updates the source checkout, rebuilds the CLI, reinstalls it, and updates Prometheus. Pass `--verbose` after `update` to show installer output.
 
-The tool accepts `.rbxl`, `.rbxm`, `.rbxlx`, and `.rbxmx` inputs. It refuses to write the obfuscation output path when it resolves to the same file as the input, and extraction refuses to use the input file as the output folder.
+The tool accepts `.rbxl`, `.rbxm`, `.rbxlx`, and `.rbxmx` inputs. It refuses to write the obfuscation output path when it resolves to the same file as the input, extraction refuses to use the input file as the output folder, and compile refuses to overwrite the preserved original snapshot or the recorded original input file.
 
 ## Extraction
 
@@ -160,6 +189,7 @@ Ro-TransLink-extracted/
   instances.json
   content_refs.json
   manifest.json
+  .rbx-obfuscator/
 ```
 
 Extraction exports:
@@ -169,8 +199,11 @@ Extraction exports:
 - a readable `instances.json` hierarchy with safe serializable properties
 - asset/content references such as `rbxassetid://`, `rbxasset://`, Roblox asset URLs, texture IDs, mesh IDs, sound IDs, and animation IDs
 - a manifest with counts, warnings, unsupported property notes, and exported script metadata
+- hidden compile metadata and an original-file snapshot so `compile` can preserve unsupported Roblox data while applying safe edits
 
 Extraction does not decompile bytecode, recover source that is not stored in the file, download external assets, or claim raw assets were recovered. It lists references that are available in serializable properties.
+
+Folders extracted by older versions do not have `.rbx-obfuscator/` and must be re-extracted before they can be compiled.
 
 Prometheus can fail on some Luau type syntax, such as `local Bus:ObjectValue = script.Bus` or `for _, Car: Model in pairs(cars) do`, and on some newer Luau syntax, such as if-expressions and backtick string interpolation. By default, the tool only applies this Luau compatibility preprocessing after Prometheus fails for a script, then retries that one script once. Use `--strip-types` to preprocess every script before Prometheus runs.
 
@@ -193,6 +226,7 @@ To test the working checkout without installing or updating the released CLI, ru
 cargo run -- --help
 cargo run -- obfuscate /Users/lincolnmuller/Documents/train\ game.rbxl --level high --output /tmp/train_game_obfuscated_high.rbxl
 cargo run -- extract /Users/lincolnmuller/Documents/train\ game.rbxl /tmp/train_game_components
+cargo run -- compile /tmp/train_game_components /tmp/train_game_compiled.rbxl
 ```
 
 The `--` after `cargo run` separates Cargo's flags from `rbx-obfuscator`'s flags. This always uses the code in the current checkout.

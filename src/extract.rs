@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -15,7 +15,8 @@ use serde_json::Value;
 
 use crate::{
     child_path, read_roblox_file, same_path, sanitize_filename, validate_input_format,
-    ProgressEvent, RobloxFileFormat, SCRIPT_CLASSES,
+    CompileMetadata, CompileScriptEntry, ProgressEvent, RobloxFileFormat,
+    COMPILE_BASELINE_INSTANCES_FILE, COMPILE_METADATA_FILE, COMPILE_STATE_DIR, SCRIPT_CLASSES,
 };
 
 #[derive(Debug)]
@@ -64,6 +65,7 @@ struct ExtractionCounts {
 
 #[derive(Debug, Serialize)]
 struct ScriptManifestEntry {
+    id: String,
     roblox_path: String,
     class_name: String,
     output_file: Option<PathBuf>,
@@ -74,6 +76,7 @@ struct ScriptManifestEntry {
 
 #[derive(Clone, Debug, Serialize)]
 struct InstanceNode {
+    id: String,
     name: String,
     class_name: String,
     roblox_path: String,
@@ -91,6 +94,7 @@ struct ContentReference {
 
 #[derive(Clone, Debug)]
 struct ScriptExport {
+    id: String,
     roblox_path: String,
     class_name: String,
     name: String,
@@ -103,11 +107,29 @@ struct ScriptExport {
 struct ExtractionCollector {
     instance_roots: Vec<InstanceNode>,
     scripts: Vec<ScriptExport>,
+    instance_ids: HashMap<Ref, String>,
     gui_roots: Vec<Ref>,
     content_refs: Vec<ContentReference>,
     warnings: Vec<String>,
     unsupported_properties: Vec<String>,
     total_instances: usize,
+    next_instance_id: usize,
+}
+
+impl ExtractionCollector {
+    fn next_id(&mut self, referent: Ref) -> String {
+        self.next_instance_id += 1;
+        let id = format!("inst_{:06}", self.next_instance_id);
+        self.instance_ids.insert(referent, id.clone());
+        id
+    }
+
+    fn id_for(&self, referent: Ref) -> Result<String> {
+        self.instance_ids
+            .get(&referent)
+            .cloned()
+            .ok_or_else(|| anyhow!("missing extraction id for instance referent {referent}"))
+    }
 }
 
 pub fn run(options: ExtractOptions) -> Result<ExtractSummary> {
@@ -228,6 +250,21 @@ where
     if should_cancel() {
         bail!("operation cancelled");
     }
+
+    progress(ProgressEvent::CurrentItem {
+        label: "Current thing".to_owned(),
+        value: "Writing compile metadata".to_owned(),
+    });
+    write_compile_state(
+        &options.input,
+        input_format,
+        &options.output_folder,
+        &collector.instance_roots,
+        &script_manifest,
+    )?;
+    if should_cancel() {
+        bail!("operation cancelled");
+    }
     progress(ProgressEvent::StageCompleted {
         stage_index: 2,
         stage_total: 3,
@@ -336,6 +373,7 @@ fn collect_instance(
         .ok_or_else(|| anyhow!("DOM contains missing child referent"))?;
     let name = instance.name.clone();
     let class_name = instance.class.to_string();
+    let id = collector.next_id(referent);
     let path = child_path(parent_path, &name);
     let mut segments = parent_segments.to_vec();
     segments.push(name.clone());
@@ -349,6 +387,7 @@ fn collect_instance(
             collector.warnings.push(warning.clone());
         }
         collector.scripts.push(ScriptExport {
+            id: id.clone(),
             roblox_path: path.clone(),
             class_name: class_name.clone(),
             name: name.clone(),
@@ -373,6 +412,7 @@ fn collect_instance(
     }
 
     Ok(InstanceNode {
+        id,
         name,
         class_name,
         roblox_path: path,
@@ -392,6 +432,7 @@ fn write_scripts(
     for script in scripts {
         let Some(source) = &script.source else {
             manifest.push(ScriptManifestEntry {
+                id: script.id.clone(),
                 roblox_path: script.roblox_path.clone(),
                 class_name: script.class_name.clone(),
                 output_file: None,
@@ -420,6 +461,7 @@ fn write_scripts(
             .with_context(|| format!("failed to write script {}", path.display()))?;
 
         manifest.push(ScriptManifestEntry {
+            id: script.id.clone(),
             roblox_path: script.roblox_path.clone(),
             class_name: script.class_name.clone(),
             output_file: Some(path),
@@ -483,12 +525,68 @@ fn export_instance_node(
     }
 
     Ok(InstanceNode {
+        id: collector.id_for(referent)?,
         name: instance.name.clone(),
         class_name: instance.class.to_string(),
         roblox_path: path.clone(),
         properties: serializable_properties(instance, &path, collector),
         children,
     })
+}
+
+fn write_compile_state(
+    input: &Path,
+    input_format: RobloxFileFormat,
+    output_folder: &Path,
+    instance_roots: &[InstanceNode],
+    script_manifest: &[ScriptManifestEntry],
+) -> Result<()> {
+    let state_dir = output_folder.join(COMPILE_STATE_DIR);
+    fs::create_dir_all(&state_dir).with_context(|| {
+        format!(
+            "failed to create compile metadata folder {}",
+            state_dir.display()
+        )
+    })?;
+
+    let snapshot_path = PathBuf::from(format!("original.{}", input_format.extension()));
+    fs::copy(input, state_dir.join(&snapshot_path)).with_context(|| {
+        format!(
+            "failed to preserve original Roblox file in {}",
+            state_dir.display()
+        )
+    })?;
+
+    let baseline_path = PathBuf::from(COMPILE_BASELINE_INSTANCES_FILE);
+    write_json(&state_dir.join(&baseline_path), &instance_roots)?;
+    let recorded_input = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
+
+    let metadata = CompileMetadata {
+        version: 1,
+        input: recorded_input,
+        input_format,
+        original_snapshot: snapshot_path,
+        baseline_instances: baseline_path,
+        scripts: script_manifest
+            .iter()
+            .map(|entry| CompileScriptEntry {
+                id: entry.id.clone(),
+                roblox_path: entry.roblox_path.clone(),
+                class_name: entry.class_name.clone(),
+                source_file: entry
+                    .output_file
+                    .as_ref()
+                    .map(|path| relative_output_path(output_folder, path)),
+            })
+            .collect(),
+    };
+    write_json(&state_dir.join(COMPILE_METADATA_FILE), &metadata)
+}
+
+fn relative_output_path(output_folder: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(output_folder)
+        .unwrap_or(path)
+        .to_path_buf()
 }
 
 fn script_source(
@@ -822,6 +920,14 @@ mod tests {
         assert_eq!(summary.scripts_exported, 1);
         assert_eq!(summary.guis_exported, 1);
         assert!(output.join("manifest.json").exists());
+        assert!(output
+            .join(COMPILE_STATE_DIR)
+            .join(COMPILE_METADATA_FILE)
+            .exists());
+        assert!(output
+            .join(COMPILE_STATE_DIR)
+            .join(COMPILE_BASELINE_INSTANCES_FILE)
+            .exists());
         assert!(events
             .iter()
             .any(|event| matches!(event, ProgressEvent::StageStarted { stage_index: 1, .. })));

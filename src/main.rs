@@ -37,11 +37,11 @@ impl From<CliObfuscationLevel> for rbxl_obfuscate::ObfuscationLevel {
     author,
     version,
     about = "Obfuscate Roblox files or extract readable project components",
-    long_about = "Run without a command to open the interactive wizard.\n\nUse `rbx-obfuscator obfuscate` for Prometheus obfuscation.\nUse `rbx-obfuscator extract` for component extraction.",
-    after_help = "Required Obfuscation Flags:\n  --level <minimal|low|medium|high>    Required for `obfuscate`; values are case-insensitive\n\nExamples:\n  rbx-obfuscator\n  rbx-obfuscator obfuscate /path/to/game.rbxl --level high --output ~/game-obfuscated.rbxl\n  rbx-obfuscator extract /path/to/game.rbxl --output ./game-components\n  rbx-obfuscator update"
+    long_about = "Run without a command to open the interactive wizard.\n\nUse `rbx-obfuscator obfuscate` for Prometheus obfuscation.\nUse `rbx-obfuscator extract` for component extraction.\nUse `rbx-obfuscator compile` to rebuild an extracted project.",
+    after_help = "Required Obfuscation Flags:\n  --level <minimal|low|medium|high>    Required for `obfuscate`; values are case-insensitive\n\nExamples:\n  rbx-obfuscator\n  rbx-obfuscator obfuscate /path/to/game.rbxl --level high --output ~/game-obfuscated.rbxl\n  rbx-obfuscator extract /path/to/game.rbxl --output ./game-components\n  rbx-obfuscator compile ./game-components --output ~/game-compiled.rbxl\n  rbx-obfuscator update"
 )]
 struct Cli {
-    /// Output path for obfuscate or extract. Can also be passed after those commands.
+    /// Output path for obfuscate, extract, or compile. Can also be passed after those commands.
     #[arg(short, long, value_name = "OUTPUT")]
     output: Option<PathBuf>,
 
@@ -56,6 +56,9 @@ enum CliCommand {
 
     /// Extract scripts, GUI JSON, instance hierarchy, and content references.
     Extract(ExtractCli),
+
+    /// Compile a previously extracted project back into a Roblox file.
+    Compile(CompileCli),
 
     /// Update the CLI and managed dependencies.
     Update(UpdateCli),
@@ -137,6 +140,30 @@ struct ExtractCli {
 
 #[derive(Debug, Parser)]
 #[command(
+    name = "rbx-obfuscator compile",
+    about = "Compile a previously extracted project into a Roblox file",
+    after_help = "Examples:\n  rbx-obfuscator compile /Users/lincolnmuller/Documents/train\\ game\n  rbx-obfuscator compile /Users/lincolnmuller/Documents/train\\ game --output ~/train_game_compiled.rbxl\n\nOnly projects extracted by a compile-aware version can be compiled."
+)]
+struct CompileCli {
+    /// Extracted project folder created by `rbx-obfuscator extract`.
+    #[arg(value_name = "EXTRACTED_FOLDER")]
+    input_folder: PathBuf,
+
+    /// Output Roblox file. Defaults to <original-input-stem>-compiled.<extension>.
+    #[arg(value_name = "OUTPUT_FILE")]
+    output_file: Option<PathBuf>,
+
+    /// Output Roblox file. Defaults to <original-input-stem>-compiled.<extension>.
+    #[arg(short, long, value_name = "OUTPUT")]
+    output: Option<PathBuf>,
+
+    /// Show detailed compile logs.
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+#[derive(Debug, Parser)]
+#[command(
     name = "rbx-obfuscator update",
     about = "Update rbx-obfuscator and managed dependencies"
 )]
@@ -151,6 +178,7 @@ enum AppMode {
     Wizard,
     Obfuscate(ObfuscateCli, Option<PathBuf>),
     Extract(ExtractCli, Option<PathBuf>),
+    Compile(CompileCli, Option<PathBuf>),
     Update(UpdateCli),
 }
 
@@ -164,6 +192,7 @@ fn main() -> Result<()> {
         AppMode::Wizard => tui::run_wizard(),
         AppMode::Obfuscate(cli, output) => tui::run_obfuscation(cli.into_options(output)?),
         AppMode::Extract(cli, output) => tui::run_extraction(cli.into_options(output)?),
+        AppMode::Compile(cli, output) => tui::run_compile(cli.into_options(output)?),
         AppMode::Update(update_cli) => run_update(update_cli),
     }
 }
@@ -182,6 +211,10 @@ where
             let output = resolve_output(cli.output, command.output.take())?;
             Ok(AppMode::Extract(command, output))
         }
+        Some(CliCommand::Compile(mut command)) => {
+            let output = resolve_output(cli.output, command.output.take())?;
+            Ok(AppMode::Compile(command, output))
+        }
         Some(CliCommand::Update(command)) => {
             if cli.output.is_some() {
                 Err(Cli::command().error(
@@ -196,7 +229,7 @@ where
             if cli.output.is_some() {
                 Err(Cli::command().error(
                     ErrorKind::ArgumentConflict,
-                    "--output requires `obfuscate` or `extract`",
+                    "--output requires `obfuscate`, `extract`, or `compile`",
                 ))
             } else {
                 Ok(AppMode::Wizard)
@@ -235,6 +268,27 @@ impl ExtractCli {
         Ok(rbxl_obfuscate::extract::ExtractOptions {
             input: self.input,
             output_folder,
+            verbose: self.verbose,
+        })
+    }
+}
+
+impl CompileCli {
+    fn into_options(
+        self,
+        output: Option<PathBuf>,
+    ) -> Result<rbxl_obfuscate::compile::CompileOptions> {
+        let output = match (self.output_file, output) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("use either positional OUTPUT_FILE or --output, not both")
+            }
+            (Some(output_file), None) | (None, Some(output_file)) => Some(output_file),
+            (None, None) => None,
+        };
+
+        Ok(rbxl_obfuscate::compile::CompileOptions {
+            input_folder: self.input_folder,
+            output,
             verbose: self.verbose,
         })
     }
@@ -490,6 +544,64 @@ mod tests {
         assert_eq!(output, None);
         let options = cli.into_options(output).unwrap();
         assert_eq!(options.output_folder, PathBuf::from("projects/train game"));
+    }
+
+    #[test]
+    fn compile_command_is_supported() {
+        let AppMode::Compile(cli, output) = parse_app_mode(
+            [
+                "rbx-obfuscator",
+                "compile",
+                "output-folder",
+                "compiled.rbxl",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected compile mode");
+        };
+
+        assert_eq!(cli.input_folder, PathBuf::from("output-folder"));
+        assert_eq!(cli.output_file, Some(PathBuf::from("compiled.rbxl")));
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn compile_output_flag_is_supported() {
+        let AppMode::Compile(cli, output) = parse_app_mode(
+            [
+                "rbx-obfuscator",
+                "compile",
+                "output-folder",
+                "--output",
+                "compiled.rbxl",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected compile mode");
+        };
+
+        assert_eq!(cli.input_folder, PathBuf::from("output-folder"));
+        assert_eq!(cli.output_file, None);
+        assert_eq!(output, Some(PathBuf::from("compiled.rbxl")));
+
+        let options = cli.into_options(output).unwrap();
+        assert_eq!(options.output, Some(PathBuf::from("compiled.rbxl")));
+    }
+
+    #[test]
+    fn compile_output_is_optional() {
+        let AppMode::Compile(cli, output) =
+            parse_app_mode(["rbx-obfuscator", "compile", "output-folder"].map(OsString::from))
+                .unwrap()
+        else {
+            panic!("expected compile mode");
+        };
+
+        assert_eq!(cli.input_folder, PathBuf::from("output-folder"));
+        assert_eq!(cli.output_file, None);
+        assert_eq!(output, None);
     }
 
     #[test]

@@ -25,6 +25,7 @@ use ratatui::{
 };
 
 use rbxl_obfuscate::{
+    compile::{CompileOptions, CompileSummary},
     default_output_path,
     extract::{ExtractOptions, ExtractSummary},
     LongScriptAction, LongScriptContext, LongScriptPhase, ObfuscationLevel, ObfuscationSummary,
@@ -34,6 +35,7 @@ use rbxl_obfuscate::{
 const APP_TITLE: &str = "rbx-obfuscator v1.0";
 const STAGE_WEIGHTS_OBFUSCATE: [f64; 3] = [0.15, 0.70, 0.15];
 const STAGE_WEIGHTS_EXTRACT: [f64; 3] = [0.25, 0.55, 0.20];
+const STAGE_WEIGHTS_COMPILE: [f64; 3] = [0.25, 0.55, 0.20];
 const LEVELS: [ObfuscationLevel; 4] = [
     ObfuscationLevel::Minimal,
     ObfuscationLevel::Low,
@@ -103,6 +105,15 @@ pub fn run_extraction(options: ExtractOptions) -> Result<()> {
     )
 }
 
+pub fn run_compile(options: CompileOptions) -> Result<()> {
+    let mut terminal = TerminalSession::enter()?;
+    run_operation_request(
+        &mut terminal,
+        OperationRequest::Compile(options),
+        CompletionExit::After(Duration::from_secs(1)),
+    )
+}
+
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -139,6 +150,7 @@ impl Drop for TerminalSession {
 enum WizardMode {
     Obfuscate,
     Extract,
+    Compile,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +173,7 @@ enum WizardAction {
 enum OperationRequest {
     Obfuscate(Options),
     Extract(ExtractOptions),
+    Compile(CompileOptions),
 }
 
 impl OperationRequest {
@@ -168,6 +181,7 @@ impl OperationRequest {
         match self {
             Self::Obfuscate(_) => WizardMode::Obfuscate,
             Self::Extract(_) => WizardMode::Extract,
+            Self::Compile(_) => WizardMode::Compile,
         }
     }
 }
@@ -206,9 +220,30 @@ impl WizardState {
         LEVELS[self.level_index]
     }
 
+    fn select_previous_mode(&mut self) {
+        self.mode = match self.mode {
+            WizardMode::Obfuscate => WizardMode::Obfuscate,
+            WizardMode::Extract => WizardMode::Obfuscate,
+            WizardMode::Compile => WizardMode::Extract,
+        };
+    }
+
+    fn select_next_mode(&mut self) {
+        self.mode = match self.mode {
+            WizardMode::Obfuscate => WizardMode::Extract,
+            WizardMode::Extract => WizardMode::Compile,
+            WizardMode::Compile => WizardMode::Compile,
+        };
+    }
+
     fn is_input_valid(&self) -> bool {
         let path = PathBuf::from(clean_path_input(&self.input));
-        path.is_file() && rbxl_obfuscate::validate_input_format(&path).is_ok()
+        match self.mode {
+            WizardMode::Obfuscate | WizardMode::Extract => {
+                path.is_file() && rbxl_obfuscate::validate_input_format(&path).is_ok()
+            }
+            WizardMode::Compile => rbxl_obfuscate::compile::validate_compile_project(&path).is_ok(),
+        }
     }
 
     fn is_output_valid(&self) -> bool {
@@ -224,6 +259,10 @@ impl WizardState {
             }
             WizardMode::Extract => {
                 rbxl_obfuscate::extract::validate_extract_output(&input, &output).is_ok()
+            }
+            WizardMode::Compile => {
+                rbxl_obfuscate::compile::validate_compile_output_for_project(&input, &output)
+                    .is_ok()
             }
         }
     }
@@ -248,22 +287,22 @@ fn handle_home_key(state: &mut WizardState, code: KeyCode) -> Result<WizardActio
             };
         }
         KeyCode::Up => match state.step {
-            WizardStep::Mode => state.mode = WizardMode::Obfuscate,
+            WizardStep::Mode => state.select_previous_mode(),
             WizardStep::Level => state.level_index = state.level_index.saturating_sub(1),
             _ => {}
         },
         KeyCode::Down => match state.step {
-            WizardStep::Mode => state.mode = WizardMode::Extract,
+            WizardStep::Mode => state.select_next_mode(),
             WizardStep::Level => state.level_index = (state.level_index + 1).min(LEVELS.len() - 1),
             _ => {}
         },
         KeyCode::Left => match state.step {
-            WizardStep::Mode => state.mode = WizardMode::Obfuscate,
+            WizardStep::Mode => state.select_previous_mode(),
             WizardStep::Level => state.level_index = state.level_index.saturating_sub(1),
             _ => {}
         },
         KeyCode::Right => match state.step {
-            WizardStep::Mode => state.mode = WizardMode::Extract,
+            WizardStep::Mode => state.select_next_mode(),
             WizardStep::Level => state.level_index = (state.level_index + 1).min(LEVELS.len() - 1),
             _ => {}
         },
@@ -271,20 +310,36 @@ fn handle_home_key(state: &mut WizardState, code: KeyCode) -> Result<WizardActio
             WizardStep::Mode => state.step = WizardStep::Input,
             WizardStep::Input => {
                 if state.is_input_valid() {
-                    if state.output.trim().is_empty() && state.mode == WizardMode::Obfuscate {
+                    if state.output.trim().is_empty() {
                         let input = PathBuf::from(clean_path_input(&state.input));
-                        if let Ok(default_output) =
-                            default_output_path(&input, state.selected_level())
-                        {
-                            state.output = default_output.display().to_string();
+                        match state.mode {
+                            WizardMode::Obfuscate => {
+                                if let Ok(default_output) =
+                                    default_output_path(&input, state.selected_level())
+                                {
+                                    state.output = default_output.display().to_string();
+                                }
+                            }
+                            WizardMode::Compile => {
+                                if let Ok(default_output) =
+                                    rbxl_obfuscate::compile::default_output_for_project(&input)
+                                {
+                                    state.output = default_output.display().to_string();
+                                }
+                            }
+                            WizardMode::Extract => {}
                         }
                     }
                     state.step = WizardStep::Output;
                     state.message = "Input file looks good.".to_owned();
                 } else {
-                    state.message =
-                        "Input must be an existing .rbxl, .rbxm, .rbxlx, or .rbxmx file."
-                            .to_owned();
+                    state.message = match state.mode {
+                        WizardMode::Compile => {
+                            "Input must be an extracted folder with compile metadata.".to_owned()
+                        }
+                        _ => "Input must be an existing .rbxl, .rbxm, .rbxlx, or .rbxmx file."
+                            .to_owned(),
+                    };
                 }
             }
             WizardStep::Output => {
@@ -344,6 +399,11 @@ fn run_operation(terminal: &mut TerminalSession, state: WizardState) -> Result<(
             output_folder: output,
             verbose: false,
         }),
+        WizardMode::Compile => OperationRequest::Compile(CompileOptions {
+            input_folder: input,
+            output: Some(output),
+            verbose: false,
+        }),
     };
 
     run_operation_request(terminal, operation, CompletionExit::WaitForInput)
@@ -389,6 +449,21 @@ fn run_operation_request(
                     },
                 )
                 .map(WizardResult::Extraction)
+                .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(WorkerMessage::Finished(result));
+            });
+        }
+        OperationRequest::Compile(options) => {
+            let worker_cancel = Arc::clone(&cancel_requested);
+            thread::spawn(move || {
+                let result = rbxl_obfuscate::compile::run_with_progress_controlled(
+                    options,
+                    || worker_cancel.load(Ordering::SeqCst),
+                    |event| {
+                        let _ = sender.send(WorkerMessage::Progress(event));
+                    },
+                )
+                .map(WizardResult::Compile)
                 .map_err(|error| format!("{error:#}"));
                 let _ = sender.send(WorkerMessage::Finished(result));
             });
@@ -530,6 +605,7 @@ impl WorkerLongScriptControl {
 enum WizardResult {
     Obfuscation(ObfuscationSummary),
     Extraction(ExtractSummary),
+    Compile(CompileSummary),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -595,6 +671,14 @@ impl ProgressUiState {
                     ("Parse RBXL/RBXM".to_owned(), StageStatus::Pending),
                     ("Export components".to_owned(), StageStatus::Pending),
                     ("Write manifest".to_owned(), StageStatus::Pending),
+                ],
+            ),
+            WizardMode::Compile => (
+                "Compile Extracted Project",
+                vec![
+                    ("Load extracted project".to_owned(), StageStatus::Pending),
+                    ("Apply extracted edits".to_owned(), StageStatus::Pending),
+                    ("Write compiled file".to_owned(), StageStatus::Pending),
                 ],
             ),
         };
@@ -705,6 +789,7 @@ impl ProgressUiState {
         let weights = match self.mode {
             WizardMode::Obfuscate => STAGE_WEIGHTS_OBFUSCATE,
             WizardMode::Extract => STAGE_WEIGHTS_EXTRACT,
+            WizardMode::Compile => STAGE_WEIGHTS_COMPILE,
         };
         self.stage_completion
             .iter()
@@ -724,6 +809,7 @@ struct CompletionState {
     level: Option<String>,
     scripts_label: String,
     scripts_line: Option<String>,
+    instances_line: Option<String>,
     guis_line: Option<String>,
     content_refs_line: Option<String>,
     duration: Duration,
@@ -748,6 +834,7 @@ impl CompletionState {
                     "{} / {}",
                     summary.scripts_processed, summary.scripts_found
                 )),
+                instances_line: None,
                 guis_line: None,
                 content_refs_line: None,
                 duration,
@@ -774,6 +861,7 @@ impl CompletionState {
                     "{} / {}",
                     summary.scripts_exported, summary.scripts_found
                 )),
+                instances_line: None,
                 guis_line: Some(summary.guis_exported.to_string()),
                 content_refs_line: Some(summary.content_refs_found.to_string()),
                 duration,
@@ -782,6 +870,25 @@ impl CompletionState {
                     "rbx-obfuscator extract \\\n  {} \\\n  {}",
                     shell_quote_path(&summary.input),
                     shell_quote_path(&summary.output_folder)
+                ),
+            }),
+            Ok(WizardResult::Compile(summary)) => Ok(Self {
+                mode: "Compile Extracted Project".to_owned(),
+                input: display_path(&summary.input_folder),
+                output_label: "Output".to_owned(),
+                output: display_path(&summary.output),
+                level: None,
+                scripts_label: "Scripts updated".to_owned(),
+                scripts_line: Some(summary.scripts_updated.to_string()),
+                instances_line: Some(summary.instances_changed.to_string()),
+                guis_line: None,
+                content_refs_line: None,
+                duration,
+                backup: None,
+                command: format!(
+                    "rbx-obfuscator compile \\\n  {} \\\n  --output {}",
+                    shell_quote_path(&summary.input_folder),
+                    shell_quote_path(&summary.output)
                 ),
             }),
             Err(error) => bail!(error),
@@ -797,7 +904,7 @@ fn render_home(frame: &mut Frame<'_>, state: &WizardState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Length(15),
             Constraint::Min(4),
         ])
@@ -814,6 +921,10 @@ fn render_home(frame: &mut Frame<'_>, state: &WizardState) {
         option_line(
             state.mode == WizardMode::Extract,
             "Extract RBXL/RBXM Components Only",
+        ),
+        option_line(
+            state.mode == WizardMode::Compile,
+            "Compile Extracted Project",
         ),
     ];
     frame.render_widget(
@@ -983,6 +1094,9 @@ fn render_complete(frame: &mut Frame<'_>, state: &CompletionState) {
     if let Some(scripts) = &state.scripts_line {
         summary.push(summary_line(&state.scripts_label, scripts, false));
     }
+    if let Some(instances) = &state.instances_line {
+        summary.push(summary_line("Instances changed", instances, false));
+    }
     if let Some(guis) = &state.guis_line {
         summary.push(summary_line("GUIs exported", guis, false));
     }
@@ -1095,6 +1209,7 @@ fn script_status_line(state: &ProgressUiState) -> Line<'static> {
         let label = match state.mode {
             WizardMode::Obfuscate => "Scripts discovered:",
             WizardMode::Extract => "Scripts exported:",
+            WizardMode::Compile => "Scripts updated:",
         };
         return Line::from(vec![
             Span::styled(label.to_owned(), neutral_style()),
@@ -1106,6 +1221,7 @@ fn script_status_line(state: &ProgressUiState) -> Line<'static> {
     let label = match state.mode {
         WizardMode::Obfuscate => "Scripts obfuscated:",
         WizardMode::Extract => "Scripts exported:",
+        WizardMode::Compile => "Scripts updated:",
     };
     Line::from(vec![
         Span::styled(label.to_owned(), neutral_style()),
@@ -1158,18 +1274,16 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, lines: &[&str]) {
 fn step_lines(state: &WizardState) -> Vec<Line<'_>> {
     let input_valid = state.is_input_valid();
     let output_valid = state.is_output_valid();
-    let output_label = if state.mode == WizardMode::Obfuscate {
-        "Output file"
-    } else {
-        "Output folder"
+    let input_label = match state.mode {
+        WizardMode::Compile => "Extracted folder",
+        _ => "Input file",
+    };
+    let output_label = match state.mode {
+        WizardMode::Extract => "Output folder",
+        WizardMode::Obfuscate | WizardMode::Compile => "Output file",
     };
     vec![
-        step_title(
-            1,
-            "Input file",
-            input_valid,
-            state.step == WizardStep::Input,
-        ),
+        step_title(1, input_label, input_valid, state.step == WizardStep::Input),
         step_value(&state.input),
         Line::from(Span::styled(
             "  ─────────────────────────────────────────",
@@ -1189,7 +1303,7 @@ fn step_lines(state: &WizardState) -> Vec<Line<'_>> {
         step_title(
             3,
             "Prometheus level",
-            state.mode == WizardMode::Extract,
+            state.mode != WizardMode::Obfuscate,
             state.step == WizardStep::Level,
         ),
         level_line(state),
@@ -1229,8 +1343,8 @@ fn step_value(value: &str) -> Line<'_> {
 }
 
 fn level_line(state: &WizardState) -> Line<'_> {
-    if state.mode == WizardMode::Extract {
-        return Line::from(Span::styled("  not needed for extraction", neutral_style()));
+    if state.mode != WizardMode::Obfuscate {
+        return Line::from(Span::styled("  not needed for this mode", neutral_style()));
     }
 
     let labels = ["Weak", "Low", "Medium", "Strong"];
@@ -1584,6 +1698,7 @@ mod tests {
             level: Some("Strong".to_owned()),
             scripts_label: "Scripts obfuscated".to_owned(),
             scripts_line: Some("300 / 300".to_owned()),
+            instances_line: None,
             guis_line: None,
             content_refs_line: None,
             duration: Duration::from_secs(462),
@@ -1609,6 +1724,7 @@ mod tests {
             level: Some("Strong".to_owned()),
             scripts_label: "Scripts obfuscated".to_owned(),
             scripts_line: Some("18 / 19".to_owned()),
+            instances_line: None,
             guis_line: None,
             content_refs_line: None,
             duration: Duration::from_secs(8),
