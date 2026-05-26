@@ -4,13 +4,14 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::ErrorKind,
-    io::{BufReader, BufWriter},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use rbx_binary::CompressionType;
 use rbx_dom_weak::{
     types::{Ref, Variant},
     ustr, WeakDom,
@@ -36,6 +37,7 @@ const LONG_SCRIPT_PROMPT_AFTER: Duration = Duration::from_secs(10);
 const LONG_SCRIPT_AUTO_AFTER: Duration = Duration::from_secs(30);
 const LUAU_IF_HELPER_NAME: &str = "__rbx_obfuscator_luau_if";
 const LUAU_IF_HELPER: &str = "local function __rbx_obfuscator_luau_if(condition, truthy, falsy)\n\tif condition then\n\t\treturn truthy()\n\tend\n\treturn falsy()\nend\n\n";
+const ZSTD_ROBLOX_COMPAT_LEVEL: i32 = 8;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +76,21 @@ pub enum RobloxFileFormat {
     Rbxm,
     Rbxlx,
     Rbxmx,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RobloxBinaryCompression {
+    Lz4,
+    Zstd,
+}
+
+impl RobloxBinaryCompression {
+    fn to_rbx_binary(self) -> CompressionType {
+        match self {
+            Self::Lz4 => CompressionType::Lz4,
+            Self::Zstd => CompressionType::Zstd,
+        }
+    }
 }
 
 impl RobloxFileFormat {
@@ -702,7 +719,8 @@ where
         label: "Writing output file".to_owned(),
         value: output.display().to_string(),
     });
-    write_roblox_file(&output, &dom, output_format)?;
+    let binary_compression = detect_binary_compression(&options.input, input_format)?;
+    write_roblox_file_with_binary_compression(&output, &dom, output_format, binary_compression)?;
     progress(ProgressEvent::StageCompleted {
         stage_index: 3,
         stage_total: 3,
@@ -2598,10 +2616,20 @@ pub(crate) fn read_roblox_file(path: &Path, format: RobloxFileFormat) -> Result<
     }
 }
 
+#[cfg(test)]
 pub(crate) fn write_roblox_file(
     path: &Path,
     dom: &WeakDom,
     format: RobloxFileFormat,
+) -> Result<()> {
+    write_roblox_file_with_binary_compression(path, dom, format, None)
+}
+
+pub(crate) fn write_roblox_file_with_binary_compression(
+    path: &Path,
+    dom: &WeakDom,
+    format: RobloxFileFormat,
+    binary_compression: Option<RobloxBinaryCompression>,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -2623,13 +2651,23 @@ pub(crate) fn write_roblox_file(
                 )
             })?;
         } else {
-            rbx_binary::to_writer(output, dom, &top_level_refs).with_context(|| {
-                format!(
-                    "failed to write temporary Roblox binary for {}",
-                    path.display()
-                )
-            })?;
+            let serializer = rbx_binary::Serializer::new().compression_type(
+                binary_compression
+                    .unwrap_or(RobloxBinaryCompression::Lz4)
+                    .to_rbx_binary(),
+            );
+            serializer
+                .serialize(output, dom, &top_level_refs)
+                .with_context(|| {
+                    format!(
+                        "failed to write temporary Roblox binary for {}",
+                        path.display()
+                    )
+                })?;
         }
+    }
+    if matches!(binary_compression, Some(RobloxBinaryCompression::Zstd)) {
+        recompress_zstd_temp(&mut temp, ZSTD_ROBLOX_COMPAT_LEVEL)?;
     }
     temp.persist(path)
         .map_err(|error| error.error)
@@ -2640,6 +2678,139 @@ pub(crate) fn write_roblox_file(
             )
         })?;
     Ok(())
+}
+
+fn recompress_zstd_temp(temp: &mut NamedTempFile, level: i32) -> Result<()> {
+    let file = temp.as_file_mut();
+    file.flush()
+        .context("failed to flush temporary Roblox file")?;
+    file.seek(SeekFrom::Start(0))
+        .context("failed to seek temporary Roblox file")?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .context("failed to read temporary Roblox file for ZSTD recompression")?;
+    let bytes = recompress_zstd_chunks(&bytes, level)?;
+    file.set_len(0)
+        .context("failed to truncate temporary Roblox file")?;
+    file.seek(SeekFrom::Start(0))
+        .context("failed to rewind temporary Roblox file")?;
+    file.write_all(&bytes)
+        .context("failed to write recompressed temporary Roblox file")?;
+    file.flush()
+        .context("failed to flush recompressed temporary Roblox file")?;
+    Ok(())
+}
+
+fn recompress_zstd_chunks(bytes: &[u8], level: i32) -> Result<Vec<u8>> {
+    if bytes.len() < 32 {
+        bail!("temporary Roblox binary is too short to recompress");
+    }
+
+    let mut output = Vec::with_capacity(bytes.len());
+    output.extend_from_slice(&bytes[..32]);
+    let mut offset = 32usize;
+    while offset + 16 <= bytes.len() {
+        let chunk_name = &bytes[offset..offset + 4];
+        let compressed_len = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let uncompressed_len =
+            u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap());
+        let reserved = u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap());
+        offset += 16;
+        let payload_len = if compressed_len == 0 {
+            uncompressed_len
+        } else {
+            compressed_len
+        } as usize;
+        if offset + payload_len > bytes.len() {
+            bail!("temporary Roblox binary has a truncated chunk");
+        }
+        let payload = &bytes[offset..offset + payload_len];
+        offset += payload_len;
+
+        output.extend_from_slice(chunk_name);
+        if compressed_len == 0 || !payload.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            output.extend_from_slice(&compressed_len.to_le_bytes());
+            output.extend_from_slice(&uncompressed_len.to_le_bytes());
+            output.extend_from_slice(&reserved.to_le_bytes());
+            output.extend_from_slice(payload);
+        } else {
+            let decoded = zstd::bulk::decompress(payload, uncompressed_len as usize)
+                .context("failed to decompress temporary Roblox ZSTD chunk")?;
+            let encoded = zstd::bulk::compress(&decoded, level)
+                .context("failed to recompress temporary Roblox ZSTD chunk")?;
+            output.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            output.extend_from_slice(&uncompressed_len.to_le_bytes());
+            output.extend_from_slice(&reserved.to_le_bytes());
+            output.extend_from_slice(&encoded);
+        }
+
+        if chunk_name == b"END\0" {
+            output.extend_from_slice(&bytes[offset..]);
+            return Ok(output);
+        }
+    }
+
+    bail!("temporary Roblox binary ended before END chunk")
+}
+
+pub(crate) fn detect_binary_compression(
+    path: &Path,
+    format: RobloxFileFormat,
+) -> Result<Option<RobloxBinaryCompression>> {
+    if format.is_xml() {
+        return Ok(None);
+    }
+
+    let mut input = BufReader::new(
+        File::open(path)
+            .with_context(|| format!("failed to open Roblox binary file {}", path.display()))?,
+    );
+    let mut header = [0u8; 32];
+    input
+        .read_exact(&mut header)
+        .with_context(|| format!("failed to read Roblox binary header {}", path.display()))?;
+
+    loop {
+        let mut chunk_header = [0u8; 16];
+        match input.read_exact(&mut chunk_header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read chunk header {}", path.display()));
+            }
+        }
+
+        let compressed_len = u32::from_le_bytes(chunk_header[4..8].try_into().unwrap()) as usize;
+        let uncompressed_len = u32::from_le_bytes(chunk_header[8..12].try_into().unwrap()) as usize;
+        let payload_len = if compressed_len == 0 {
+            uncompressed_len
+        } else {
+            compressed_len
+        };
+
+        if compressed_len > 0 {
+            let mut magic = [0u8; 4];
+            input
+                .read_exact(&mut magic)
+                .with_context(|| format!("failed to read chunk payload {}", path.display()))?;
+            return Ok(Some(if magic == [0x28, 0xb5, 0x2f, 0xfd] {
+                RobloxBinaryCompression::Zstd
+            } else {
+                RobloxBinaryCompression::Lz4
+            }));
+        }
+
+        let mut remaining = payload_len;
+        let mut buffer = [0u8; 8192];
+        while remaining > 0 {
+            let to_read = remaining.min(buffer.len());
+            input
+                .read_exact(&mut buffer[..to_read])
+                .with_context(|| format!("failed to skip chunk payload {}", path.display()))?;
+            remaining -= to_read;
+        }
+    }
 }
 
 pub(crate) fn same_path(input: &Path, output: &Path) -> Result<bool> {

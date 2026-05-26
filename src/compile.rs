@@ -14,8 +14,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    read_roblox_file, same_path, validate_input_format, write_roblox_file, CompileMetadata,
-    ProgressEvent, COMPILE_METADATA_FILE, COMPILE_STATE_DIR, SCRIPT_CLASSES,
+    detect_binary_compression, read_roblox_file, same_path, validate_input_format,
+    write_roblox_file_with_binary_compression, CompileMetadata, ProgressEvent,
+    COMPILE_METADATA_FILE, COMPILE_STATE_DIR, SCRIPT_CLASSES,
 };
 
 #[derive(Debug)]
@@ -173,7 +174,8 @@ where
         label: "Current thing".to_owned(),
         value: output.display().to_string(),
     });
-    write_roblox_file(&output, &dom, output_format)?;
+    let binary_compression = detect_binary_compression(&snapshot, metadata.input_format)?;
+    write_roblox_file_with_binary_compression(&output, &dom, output_format, binary_compression)?;
     progress(ProgressEvent::StageCompleted {
         stage_index: 3,
         stage_total: 3,
@@ -747,7 +749,7 @@ fn render_compile_progress(event: ProgressEvent, verbose: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RobloxFileFormat;
+    use crate::{RobloxBinaryCompression, RobloxFileFormat};
     use rbx_dom_weak::InstanceBuilder;
 
     #[test]
@@ -863,6 +865,51 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("cannot add or delete instances"));
+    }
+
+    #[test]
+    fn compile_preserves_zstd_binary_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("game.rbxl");
+        let extracted = dir.path().join("game");
+        let output = dir.path().join("game-compiled.rbxl");
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("Script")
+                    .with_name("Main")
+                    .with_property("Source", "print('hi')"),
+            ),
+        );
+        crate::write_roblox_file_with_binary_compression(
+            &input,
+            &dom,
+            RobloxFileFormat::Rbxl,
+            Some(RobloxBinaryCompression::Zstd),
+        )
+        .unwrap();
+
+        crate::extract::run(crate::extract::ExtractOptions {
+            input: input.clone(),
+            output_folder: extracted.clone(),
+            verbose: false,
+        })
+        .unwrap();
+        run(CompileOptions {
+            input_folder: extracted,
+            output: Some(output.clone()),
+            verbose: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            crate::detect_binary_compression(&input, RobloxFileFormat::Rbxl).unwrap(),
+            Some(RobloxBinaryCompression::Zstd)
+        );
+        assert_eq!(
+            crate::detect_binary_compression(&output, RobloxFileFormat::Rbxl).unwrap(),
+            Some(RobloxBinaryCompression::Zstd)
+        );
+        crate::read_roblox_file(&output, RobloxFileFormat::Rbxl).unwrap();
     }
 
     fn rename_first_class(value: &mut Value, class_name: &str, new_name: &str) -> bool {
