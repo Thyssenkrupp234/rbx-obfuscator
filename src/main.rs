@@ -116,6 +116,60 @@ struct ObfuscateCli {
 
 #[derive(Debug, Parser)]
 #[command(
+    name = "rbx-obfuscator",
+    about = "Obfuscate Roblox script sources with Prometheus",
+    after_help = "Examples:\n  rbx-obfuscator /path/to/game.rbxl --level medium\n  rbx-obfuscator /path/to/game.rbxl /path/to/game-obfuscated.rbxl --level high\n  rbx-obfuscator /path/to/model.rbxm --level high --output ~/model-obfuscated.rbxm"
+)]
+struct DirectObfuscateCli {
+    /// Output file. Defaults to <input-stem>-obfuscated_<Level>.<extension>.
+    #[arg(short, long, value_name = "OUTPUT")]
+    output: Option<PathBuf>,
+
+    /// Input .rbxl, .rbxm, .rbxlx, or .rbxmx file to obfuscate.
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    /// Output file. Defaults to <input-stem>-obfuscated_<Level>.<extension>.
+    #[arg(value_name = "OUTPUT_FILE")]
+    output_file: Option<PathBuf>,
+
+    /// Required obfuscation level. Values are case-insensitive: minimal, low, medium, high.
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        value_name = "LEVEL",
+        help_heading = "Required Obfuscation Flags"
+    )]
+    level: CliObfuscationLevel,
+
+    /// Report what would be processed without running Prometheus or writing output.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Strip Luau type annotations before every Prometheus run.
+    #[arg(long)]
+    strip_types: bool,
+
+    /// Directory where original script sources should be written.
+    #[arg(long)]
+    backup_dir: Option<PathBuf>,
+
+    /// Exact normalized Roblox instance path to skip, such as game.ServerScriptService.Main.
+    #[arg(long)]
+    skip_path: Vec<String>,
+
+    /// Path to write a JSON processing manifest.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+
+    /// Show detailed script and Prometheus logs.
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+#[derive(Debug, Parser)]
+#[command(
     name = "rbx-obfuscator extract",
     about = "Extract RBXL/RBXM components without obfuscating",
     after_help = "Examples:\n  rbx-obfuscator extract /Users/lincolnmuller/Documents/train\\ game.rbxl\n  rbx-obfuscator extract /Users/lincolnmuller/Documents/train\\ game.rbxl --output ~/train_game_components\n\nWhen --output is omitted, extraction creates a folder next to INPUT using the input file name without its extension."
@@ -190,9 +244,13 @@ fn main() -> Result<()> {
 
     match mode {
         AppMode::Wizard => tui::run_wizard(),
-        AppMode::Obfuscate(cli, output) => tui::run_obfuscation(cli.into_options(output)?),
-        AppMode::Extract(cli, output) => tui::run_extraction(cli.into_options(output)?),
-        AppMode::Compile(cli, output) => tui::run_compile(cli.into_options(output)?),
+        AppMode::Obfuscate(cli, output) => rbxl_obfuscate::run(cli.into_options(output)?),
+        AppMode::Extract(cli, output) => {
+            rbxl_obfuscate::extract::run(cli.into_options(output)?).map(|_| ())
+        }
+        AppMode::Compile(cli, output) => {
+            rbxl_obfuscate::compile::run(cli.into_options(output)?).map(|_| ())
+        }
         AppMode::Update(update_cli) => run_update(update_cli),
     }
 }
@@ -201,6 +259,26 @@ fn parse_app_mode<I>(args: I) -> std::result::Result<AppMode, clap::Error>
 where
     I: IntoIterator<Item = OsString>,
 {
+    let args = args.into_iter().collect::<Vec<_>>();
+    if should_parse_direct_obfuscate(&args) {
+        let direct = DirectObfuscateCli::try_parse_from(args)?;
+        let output = resolve_output(direct.output, direct.output_file)?;
+        return Ok(AppMode::Obfuscate(
+            ObfuscateCli {
+                input: direct.input,
+                output: None,
+                level: direct.level,
+                dry_run: direct.dry_run,
+                strip_types: direct.strip_types,
+                backup_dir: direct.backup_dir,
+                skip_path: direct.skip_path,
+                manifest: direct.manifest,
+                verbose: direct.verbose,
+            },
+            output,
+        ));
+    }
+
     let cli = Cli::try_parse_from(args)?;
     match cli.command {
         Some(CliCommand::Obfuscate(mut command)) => {
@@ -236,6 +314,45 @@ where
             }
         }
     }
+}
+
+fn should_parse_direct_obfuscate(args: &[OsString]) -> bool {
+    let Some(first_positional) = first_non_option_arg(args) else {
+        return false;
+    };
+    !matches!(
+        first_positional.as_str(),
+        "obfuscate" | "extract" | "compile" | "update"
+    )
+}
+
+fn first_non_option_arg(args: &[OsString]) -> Option<String> {
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = args[index].to_string_lossy();
+        if arg == "--" {
+            return args
+                .get(index + 1)
+                .map(|arg| arg.to_string_lossy().into_owned());
+        }
+        if arg.starts_with('-') {
+            if option_takes_value(&arg) && !arg.contains('=') {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        return Some(arg.into_owned());
+    }
+    None
+}
+
+fn option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "-o" | "--output" | "--level" | "--backup-dir" | "--skip-path" | "--manifest"
+    )
 }
 
 fn resolve_output(
@@ -346,8 +463,63 @@ mod tests {
     }
 
     #[test]
-    fn direct_input_without_command_is_rejected() {
+    fn direct_input_without_level_is_rejected() {
         assert!(parse_app_mode(["rbx-obfuscator", "input.rbxl"].map(OsString::from)).is_err());
+    }
+
+    #[test]
+    fn direct_input_with_level_is_supported() {
+        let AppMode::Obfuscate(cli, output) = parse_app_mode(
+            ["rbx-obfuscator", "input.rbxl", "--level", "medium"].map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected obfuscation mode");
+        };
+
+        assert_eq!(cli.input, PathBuf::from("input.rbxl"));
+        assert_eq!(cli.level, CliObfuscationLevel::Medium);
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn direct_positional_output_is_supported() {
+        let AppMode::Obfuscate(cli, output) = parse_app_mode(
+            [
+                "rbx-obfuscator",
+                "input.rbxl",
+                "output.rbxl",
+                "--level",
+                "high",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected obfuscation mode");
+        };
+
+        assert_eq!(cli.input, PathBuf::from("input.rbxl"));
+        assert_eq!(output, Some(PathBuf::from("output.rbxl")));
+    }
+
+    #[test]
+    fn direct_output_flag_is_supported() {
+        let AppMode::Obfuscate(cli, output) = parse_app_mode(
+            [
+                "rbx-obfuscator",
+                "input.rbxm",
+                "--level",
+                "high",
+                "--output",
+                "output.rbxm",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected obfuscation mode");
+        };
+
+        assert_eq!(cli.input, PathBuf::from("input.rbxm"));
+        assert_eq!(output, Some(PathBuf::from("output.rbxm")));
     }
 
     #[test]

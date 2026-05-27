@@ -87,33 +87,6 @@ pub fn run_wizard() -> Result<()> {
     run_operation(&mut terminal, state)
 }
 
-pub fn run_obfuscation(options: Options) -> Result<()> {
-    let mut terminal = TerminalSession::enter()?;
-    run_operation_request(
-        &mut terminal,
-        OperationRequest::Obfuscate(options),
-        CompletionExit::After(Duration::from_secs(1)),
-    )
-}
-
-pub fn run_extraction(options: ExtractOptions) -> Result<()> {
-    let mut terminal = TerminalSession::enter()?;
-    run_operation_request(
-        &mut terminal,
-        OperationRequest::Extract(options),
-        CompletionExit::After(Duration::from_secs(1)),
-    )
-}
-
-pub fn run_compile(options: CompileOptions) -> Result<()> {
-    let mut terminal = TerminalSession::enter()?;
-    run_operation_request(
-        &mut terminal,
-        OperationRequest::Compile(options),
-        CompletionExit::After(Duration::from_secs(1)),
-    )
-}
-
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -189,7 +162,6 @@ impl OperationRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompletionExit {
     WaitForInput,
-    After(Duration),
 }
 
 #[derive(Debug)]
@@ -536,11 +508,6 @@ fn run_operation_request(
                 }
             }
         },
-        CompletionExit::After(duration) => {
-            terminal.draw(|frame| render_complete(frame, &completion))?;
-            thread::sleep(duration);
-            Ok(())
-        }
     }
 }
 

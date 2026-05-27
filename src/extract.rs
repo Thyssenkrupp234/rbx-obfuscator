@@ -1,13 +1,14 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs,
+    fs::{self, File},
+    io::{self, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use rbx_dom_weak::{
-    types::{ContentType, Ref, Variant},
+    types::{Ref, Variant},
     ustr, WeakDom,
 };
 use serde::Serialize;
@@ -15,8 +16,8 @@ use serde_json::Value;
 
 use crate::{
     child_path, read_roblox_file, same_path, sanitize_filename, validate_input_format,
-    CompileMetadata, CompileScriptEntry, ProgressEvent, RobloxFileFormat,
-    COMPILE_BASELINE_INSTANCES_FILE, COMPILE_METADATA_FILE, COMPILE_STATE_DIR, SCRIPT_CLASSES,
+    variant_to_json_value, CompileMetadata, CompileScriptEntry, FileFingerprint, ProgressEvent,
+    RobloxFileFormat, COMPILE_METADATA_FILE, COMPILE_STATE_DIR, SCRIPT_CLASSES,
 };
 
 #[derive(Debug)]
@@ -37,20 +38,6 @@ pub struct ExtractSummary {
     pub content_refs_found: usize,
     pub warnings_count: usize,
     pub duration: Duration,
-}
-
-#[derive(Debug, Serialize)]
-struct ExtractionManifest {
-    input: PathBuf,
-    output_folder: PathBuf,
-    timestamp: u64,
-    tool_version: &'static str,
-    mode: &'static str,
-    input_format: RobloxFileFormat,
-    counts: ExtractionCounts,
-    scripts: Vec<ScriptManifestEntry>,
-    warnings: Vec<String>,
-    unsupported_properties: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,16 +62,6 @@ struct ScriptManifestEntry {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct InstanceNode {
-    id: String,
-    name: String,
-    class_name: String,
-    roblox_path: String,
-    properties: BTreeMap<String, Value>,
-    children: Vec<InstanceNode>,
-}
-
-#[derive(Clone, Debug, Serialize)]
 struct ContentReference {
     roblox_path: String,
     class_name: String,
@@ -103,32 +80,155 @@ struct ScriptExport {
     warning: Option<String>,
 }
 
-#[derive(Default)]
 struct ExtractionCollector {
-    instance_roots: Vec<InstanceNode>,
     scripts: Vec<ScriptExport>,
-    instance_ids: HashMap<Ref, String>,
-    gui_roots: Vec<Ref>,
-    content_refs: Vec<ContentReference>,
-    warnings: Vec<String>,
-    unsupported_properties: Vec<String>,
+    gui_roots: Vec<GuiRoot>,
+    gui_instance_ids: HashMap<Ref, String>,
+    content_refs: Option<JsonArrayWriter>,
+    warnings: Option<JsonArrayWriter>,
+    unsupported_properties: Option<JsonArrayWriter>,
+    content_refs_count: usize,
+    warnings_count: usize,
+    unsupported_properties_count: usize,
     total_instances: usize,
     next_instance_id: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GuiRoot {
+    referent: Ref,
+}
+
 impl ExtractionCollector {
-    fn next_id(&mut self, referent: Ref) -> String {
+    fn new(
+        content_refs: Option<JsonArrayWriter>,
+        warnings: Option<JsonArrayWriter>,
+        unsupported_properties: Option<JsonArrayWriter>,
+    ) -> Self {
+        Self {
+            scripts: Vec::new(),
+            gui_roots: Vec::new(),
+            gui_instance_ids: HashMap::new(),
+            content_refs,
+            warnings,
+            unsupported_properties,
+            content_refs_count: 0,
+            warnings_count: 0,
+            unsupported_properties_count: 0,
+            total_instances: 0,
+            next_instance_id: 0,
+        }
+    }
+
+    fn next_id(&mut self) -> String {
         self.next_instance_id += 1;
-        let id = format!("inst_{:06}", self.next_instance_id);
-        self.instance_ids.insert(referent, id.clone());
-        id
+        format!("inst_{:06}", self.next_instance_id)
     }
 
     fn id_for(&self, referent: Ref) -> Result<String> {
-        self.instance_ids
+        self.gui_instance_ids
             .get(&referent)
             .cloned()
             .ok_or_else(|| anyhow!("missing extraction id for instance referent {referent}"))
+    }
+
+    fn record_gui_id(&mut self, referent: Ref, id: &str) {
+        self.gui_instance_ids.insert(referent, id.to_owned());
+    }
+
+    fn record_warning(&mut self, warning: String) -> Result<()> {
+        self.warnings_count += 1;
+        if let Some(writer) = &mut self.warnings {
+            writer.push(&warning)?;
+        }
+        Ok(())
+    }
+
+    fn record_unsupported_property(&mut self, note: String) -> Result<()> {
+        self.unsupported_properties_count += 1;
+        if let Some(writer) = &mut self.unsupported_properties {
+            writer.push(&note)?;
+        }
+        self.record_warning(note)
+    }
+
+    fn record_content_ref(&mut self, reference: ContentReference) -> Result<()> {
+        self.content_refs_count += 1;
+        if let Some(writer) = &mut self.content_refs {
+            writer.push(&reference)?;
+        }
+        Ok(())
+    }
+
+    fn finish_array_writers(&mut self) -> Result<()> {
+        if let Some(writer) = &mut self.content_refs {
+            writer.finish()?;
+        }
+        if let Some(writer) = &mut self.warnings {
+            writer.finish()?;
+        }
+        if let Some(writer) = &mut self.unsupported_properties {
+            writer.finish()?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for ExtractionCollector {
+    fn default() -> Self {
+        Self::new(None, None, None)
+    }
+}
+
+struct JsonArrayWriter {
+    writer: BufWriter<File>,
+    first: bool,
+    finished: bool,
+}
+
+impl JsonArrayWriter {
+    fn create(path: &Path) -> Result<Self> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create JSON output directory {}",
+                parent.display()
+            )
+        })?;
+        let mut writer = BufWriter::new(
+            File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+        );
+        writer
+            .write_all(b"[\n")
+            .with_context(|| format!("failed to initialize {}", path.display()))?;
+        Ok(Self {
+            writer,
+            first: true,
+            finished: false,
+        })
+    }
+
+    fn push(&mut self, value: &impl Serialize) -> Result<()> {
+        if !self.first {
+            self.writer.write_all(b",\n")?;
+        }
+        self.first = false;
+        self.writer.write_all(b"  ")?;
+        serde_json::to_writer(&mut self.writer, value).context("failed to serialize JSON item")?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.writer.write_all(b"\n]\n")?;
+        self.writer.flush()?;
+        self.finished = true;
+        Ok(())
     }
 }
 
@@ -163,6 +263,16 @@ where
     let started_at = Instant::now();
     let input_format = validate_input_format(&options.input)?;
     validate_extract_options(&options)?;
+    if !input_format.is_xml()
+        && crate::binary_fast::binary_instance_count(&options.input)? >= 200_000
+    {
+        return crate::binary_fast::extract_binary_large(
+            options,
+            input_format,
+            should_cancel,
+            progress,
+        );
+    }
 
     progress(ProgressEvent::StageStarted {
         stage_index: 1,
@@ -195,7 +305,31 @@ where
         )
     })?;
 
-    let mut collector = collect_components(&dom)?;
+    let state_dir = options.output_folder.join(COMPILE_STATE_DIR);
+    fs::create_dir_all(&state_dir).with_context(|| {
+        format!(
+            "failed to create compile metadata folder {}",
+            state_dir.display()
+        )
+    })?;
+    let warnings_path = state_dir.join("warnings.tmp.json");
+    let unsupported_path = state_dir.join("unsupported_properties.tmp.json");
+    let content_refs_path = options.output_folder.join("content_refs.json");
+    let mut collector = ExtractionCollector::new(
+        Some(JsonArrayWriter::create(&content_refs_path)?),
+        Some(JsonArrayWriter::create(&warnings_path)?),
+        Some(JsonArrayWriter::create(&unsupported_path)?),
+    );
+    progress(ProgressEvent::CurrentItem {
+        label: "Current thing".to_owned(),
+        value: "Writing instances.json".to_owned(),
+    });
+    write_instances_json(
+        &options.output_folder.join("instances.json"),
+        &dom,
+        &mut collector,
+        &mut should_cancel,
+    )?;
     if should_cancel() {
         bail!("operation cancelled");
     }
@@ -222,31 +356,16 @@ where
         value: "Exporting GUI JSON".to_owned(),
     });
     let gui_roots = collector.gui_roots.clone();
-    let guis_exported = write_guis(&options.output_folder, &dom, &gui_roots, &mut collector)?;
+    let guis_exported = write_guis(&options.output_folder, &dom, &gui_roots, &collector)?;
     if should_cancel() {
         bail!("operation cancelled");
     }
 
     progress(ProgressEvent::CurrentItem {
         label: "Current thing".to_owned(),
-        value: "Writing instances.json".to_owned(),
+        value: "Finalizing content_refs.json".to_owned(),
     });
-    write_json(
-        &options.output_folder.join("instances.json"),
-        &collector.instance_roots,
-    )?;
-    if should_cancel() {
-        bail!("operation cancelled");
-    }
-
-    progress(ProgressEvent::CurrentItem {
-        label: "Current thing".to_owned(),
-        value: "Writing content_refs.json".to_owned(),
-    });
-    write_json(
-        &options.output_folder.join("content_refs.json"),
-        &collector.content_refs,
-    )?;
+    collector.finish_array_writers()?;
     if should_cancel() {
         bail!("operation cancelled");
     }
@@ -259,7 +378,8 @@ where
         &options.input,
         input_format,
         &options.output_folder,
-        &collector.instance_roots,
+        &options.output_folder.join("instances.json"),
+        collector.total_instances,
         &script_manifest,
     )?;
     if should_cancel() {
@@ -280,27 +400,27 @@ where
         label: "Current thing".to_owned(),
         value: "Writing manifest.json".to_owned(),
     });
-    let warnings_count = collector.warnings.len();
-    let manifest = ExtractionManifest {
-        input: options.input.clone(),
-        output_folder: options.output_folder.clone(),
-        timestamp: timestamp_seconds(),
-        tool_version: env!("CARGO_PKG_VERSION"),
-        mode: "extract",
-        input_format,
-        counts: ExtractionCounts {
-            total_instances: collector.total_instances,
-            scripts_found: collector.scripts.len(),
-            scripts_exported,
-            guis_exported,
-            content_references_found: collector.content_refs.len(),
-            warnings_count,
-        },
-        scripts: script_manifest,
-        warnings: collector.warnings.clone(),
-        unsupported_properties: collector.unsupported_properties.clone(),
+    let warnings_count = collector.warnings_count;
+    let counts = ExtractionCounts {
+        total_instances: collector.total_instances,
+        scripts_found: collector.scripts.len(),
+        scripts_exported,
+        guis_exported,
+        content_references_found: collector.content_refs_count,
+        warnings_count,
     };
-    write_json(&options.output_folder.join("manifest.json"), &manifest)?;
+    write_manifest(
+        &options.output_folder.join("manifest.json"),
+        &options.input,
+        &options.output_folder,
+        input_format,
+        &counts,
+        &script_manifest,
+        &warnings_path,
+        &unsupported_path,
+    )?;
+    let _ = fs::remove_file(&warnings_path);
+    let _ = fs::remove_file(&unsupported_path);
     progress(ProgressEvent::StageCompleted {
         stage_index: 3,
         stage_total: 3,
@@ -315,7 +435,7 @@ where
         scripts_found: collector.scripts.len(),
         scripts_exported,
         guis_exported,
-        content_refs_found: collector.content_refs.len(),
+        content_refs_found: collector.content_refs_count,
         warnings_count,
         duration: started_at.elapsed(),
     })
@@ -347,6 +467,7 @@ fn validate_extract_options(options: &ExtractOptions) -> Result<()> {
     validate_extract_output(&options.input, &options.output_folder)
 }
 
+#[cfg(test)]
 fn collect_components(dom: &WeakDom) -> Result<ExtractionCollector> {
     let mut collector = ExtractionCollector::default();
     let root = dom
@@ -354,37 +475,43 @@ fn collect_components(dom: &WeakDom) -> Result<ExtractionCollector> {
         .ok_or_else(|| anyhow!("DOM root is missing"))?;
 
     for child_ref in root.children().iter().copied() {
-        let node = collect_instance(dom, child_ref, "game", &[], &mut collector)?;
-        collector.instance_roots.push(node);
+        collect_instance(dom, child_ref, "game", &[], false, &mut collector)?;
     }
 
     Ok(collector)
 }
 
+#[cfg(test)]
 fn collect_instance(
     dom: &WeakDom,
     referent: Ref,
     parent_path: &str,
     parent_segments: &[String],
+    inside_gui: bool,
     collector: &mut ExtractionCollector,
-) -> Result<InstanceNode> {
+) -> Result<()> {
     let instance = dom
         .get_by_ref(referent)
         .ok_or_else(|| anyhow!("DOM contains missing child referent"))?;
     let name = instance.name.clone();
     let class_name = instance.class.to_string();
-    let id = collector.next_id(referent);
+    let id = collector.next_id();
     let path = child_path(parent_path, &name);
     let mut segments = parent_segments.to_vec();
     segments.push(name.clone());
     let child_refs = instance.children().to_vec();
+    let is_gui = is_gui_root(&class_name);
+    let inside_gui = inside_gui || is_gui;
 
     collector.total_instances += 1;
+    if inside_gui {
+        collector.record_gui_id(referent, &id);
+    }
 
     if is_script_class(&class_name) {
         let (source, warning) = script_source(instance, &path);
         if let Some(warning) = &warning {
-            collector.warnings.push(warning.clone());
+            collector.record_warning(warning.clone())?;
         }
         collector.scripts.push(ScriptExport {
             id: id.clone(),
@@ -397,28 +524,165 @@ fn collect_instance(
         });
     }
 
-    if is_gui_root(&class_name) {
-        collector.gui_roots.push(referent);
+    if is_gui {
+        collector.gui_roots.push(GuiRoot { referent });
     }
 
-    collect_content_refs(instance, &path, &class_name, collector);
+    collect_content_refs(instance, &path, &class_name, collector)?;
+    let _ = serializable_properties(instance, &path, collector)?;
 
-    let properties = serializable_properties(instance, &path, collector);
-    let mut children = Vec::with_capacity(child_refs.len());
     for child_ref in child_refs {
-        children.push(collect_instance(
-            dom, child_ref, &path, &segments, collector,
-        )?);
+        collect_instance(dom, child_ref, &path, &segments, inside_gui, collector)?;
     }
 
-    Ok(InstanceNode {
-        id,
-        name,
-        class_name,
-        roblox_path: path,
-        properties,
-        children,
-    })
+    Ok(())
+}
+
+fn write_instances_json<C>(
+    path: &Path,
+    dom: &WeakDom,
+    collector: &mut ExtractionCollector,
+    should_cancel: &mut C,
+) -> Result<()>
+where
+    C: FnMut() -> bool,
+{
+    let mut writer = BufWriter::new(
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+    );
+    writer.write_all(b"[\n")?;
+    let root = dom
+        .get_by_ref(dom.root_ref())
+        .ok_or_else(|| anyhow!("DOM root is missing"))?;
+    let mut first = true;
+    for child_ref in root.children().iter().copied() {
+        if !first {
+            writer.write_all(b",\n")?;
+        }
+        first = false;
+        write_instance_node(
+            &mut writer,
+            dom,
+            child_ref,
+            "game",
+            &[],
+            false,
+            1,
+            collector,
+            should_cancel,
+        )?;
+    }
+    writer.write_all(b"\n]\n")?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_instance_node<C>(
+    writer: &mut dyn Write,
+    dom: &WeakDom,
+    referent: Ref,
+    parent_path: &str,
+    parent_segments: &[String],
+    inside_gui: bool,
+    indent: usize,
+    collector: &mut ExtractionCollector,
+    should_cancel: &mut C,
+) -> Result<()>
+where
+    C: FnMut() -> bool,
+{
+    let instance = dom
+        .get_by_ref(referent)
+        .ok_or_else(|| anyhow!("DOM contains missing child referent"))?;
+    let name = instance.name.clone();
+    let class_name = instance.class.to_string();
+    let id = collector.next_id();
+    let path = child_path(parent_path, &name);
+    let mut segments = parent_segments.to_vec();
+    segments.push(name.clone());
+    let child_refs = instance.children().to_vec();
+    let is_gui = is_gui_root(&class_name);
+    let inside_gui = inside_gui || is_gui;
+
+    collector.total_instances += 1;
+    if collector.total_instances.is_multiple_of(1024) && should_cancel() {
+        bail!("operation cancelled");
+    }
+    if inside_gui {
+        collector.record_gui_id(referent, &id);
+    }
+
+    if is_script_class(&class_name) {
+        let (source, warning) = script_source(instance, &path);
+        if let Some(warning) = &warning {
+            collector.record_warning(warning.clone())?;
+        }
+        collector.scripts.push(ScriptExport {
+            id: id.clone(),
+            roblox_path: path.clone(),
+            class_name: class_name.clone(),
+            name: name.clone(),
+            parent_segments: parent_segments.to_vec(),
+            source,
+            warning,
+        });
+    }
+
+    if is_gui {
+        collector.gui_roots.push(GuiRoot { referent });
+    }
+
+    collect_content_refs(instance, &path, &class_name, collector)?;
+    let properties = serializable_properties(instance, &path, collector)?;
+
+    write_indent(writer, indent)?;
+    writer.write_all(b"{\"id\":")?;
+    serde_json::to_writer(&mut *writer, &id)?;
+    writer.write_all(b",\"name\":")?;
+    serde_json::to_writer(&mut *writer, &name)?;
+    writer.write_all(b",\"class_name\":")?;
+    serde_json::to_writer(&mut *writer, &class_name)?;
+    writer.write_all(b",\"roblox_path\":")?;
+    serde_json::to_writer(&mut *writer, &path)?;
+    writer.write_all(b",\"properties\":")?;
+    serde_json::to_writer(&mut *writer, &properties)?;
+    writer.write_all(b",\"children\":[")?;
+    if !child_refs.is_empty() {
+        writer.write_all(b"\n")?;
+    }
+    let mut first = true;
+    for child_ref in child_refs {
+        if !first {
+            writer.write_all(b",\n")?;
+        }
+        first = false;
+        write_instance_node(
+            writer,
+            dom,
+            child_ref,
+            &path,
+            &segments,
+            inside_gui,
+            indent + 1,
+            collector,
+            should_cancel,
+        )?;
+    }
+    if !first {
+        writer.write_all(b"\n")?;
+        write_indent(writer, indent)?;
+    }
+    writer.write_all(b"]}")?;
+    Ok(())
+}
+
+fn write_indent(writer: &mut dyn Write, indent: usize) -> io::Result<()> {
+    for _ in 0..indent {
+        writer.write_all(b"  ")?;
+    }
+    Ok(())
 }
 
 fn write_scripts(
@@ -477,8 +741,8 @@ fn write_scripts(
 fn write_guis(
     output_folder: &Path,
     dom: &WeakDom,
-    gui_roots: &[Ref],
-    collector: &mut ExtractionCollector,
+    gui_roots: &[GuiRoot],
+    collector: &ExtractionCollector,
 ) -> Result<usize> {
     let gui_root = output_folder.join("guis");
     fs::create_dir_all(&gui_root).with_context(|| {
@@ -490,9 +754,9 @@ fn write_guis(
     let mut used_paths = HashSet::new();
     let mut count = 0usize;
 
-    for gui_ref in gui_roots {
+    for gui in gui_roots {
         let instance = dom
-            .get_by_ref(*gui_ref)
+            .get_by_ref(gui.referent)
             .ok_or_else(|| anyhow!("DOM contains missing GUI referent"))?;
         let file_name = format!(
             "{}.{}.json",
@@ -500,45 +764,88 @@ fn write_guis(
             sanitize_filename(instance.class.as_str())
         );
         let path = unique_path(&gui_root.join(file_name), &mut used_paths);
-        let node = export_instance_node(dom, *gui_ref, "game", collector)?;
-        write_json(&path, &node)?;
+        let mut writer = BufWriter::new(
+            File::create(&path).with_context(|| format!("failed to create {}", path.display()))?,
+        );
+        write_gui_instance_node(&mut writer, dom, gui.referent, "game", 0, collector)?;
+        writer
+            .write_all(b"\n")
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("failed to write {}", path.display()))?;
         count += 1;
     }
 
     Ok(count)
 }
 
-fn export_instance_node(
+fn write_gui_instance_node(
+    writer: &mut dyn Write,
     dom: &WeakDom,
     referent: Ref,
     parent_path: &str,
-    collector: &mut ExtractionCollector,
-) -> Result<InstanceNode> {
+    indent: usize,
+    collector: &ExtractionCollector,
+) -> Result<()> {
     let instance = dom
         .get_by_ref(referent)
         .ok_or_else(|| anyhow!("DOM contains missing child referent"))?;
     let path = child_path(parent_path, &instance.name);
     let child_refs = instance.children().to_vec();
-    let mut children = Vec::with_capacity(child_refs.len());
-    for child_ref in child_refs {
-        children.push(export_instance_node(dom, child_ref, &path, collector)?);
-    }
+    let properties = serializable_properties_without_notes(instance);
 
-    Ok(InstanceNode {
-        id: collector.id_for(referent)?,
-        name: instance.name.clone(),
-        class_name: instance.class.to_string(),
-        roblox_path: path.clone(),
-        properties: serializable_properties(instance, &path, collector),
-        children,
-    })
+    write_indent(writer, indent)?;
+    writer.write_all(b"{\n")?;
+    write_indent(writer, indent + 1)?;
+    writer.write_all(b"\"id\": ")?;
+    serde_json::to_writer_pretty(&mut *writer, &collector.id_for(referent)?)?;
+    writer.write_all(b",\n")?;
+    write_indent(writer, indent + 1)?;
+    writer.write_all(b"\"name\": ")?;
+    serde_json::to_writer_pretty(&mut *writer, &instance.name)?;
+    writer.write_all(b",\n")?;
+    write_indent(writer, indent + 1)?;
+    writer.write_all(b"\"class_name\": ")?;
+    serde_json::to_writer_pretty(&mut *writer, instance.class.as_str())?;
+    writer.write_all(b",\n")?;
+    write_indent(writer, indent + 1)?;
+    writer.write_all(b"\"roblox_path\": ")?;
+    serde_json::to_writer_pretty(&mut *writer, &path)?;
+    writer.write_all(b",\n")?;
+    write_indent(writer, indent + 1)?;
+    writer.write_all(b"\"properties\": ")?;
+    serde_json::to_writer_pretty(&mut *writer, &properties)?;
+    writer.write_all(b",\n")?;
+    write_indent(writer, indent + 1)?;
+    writer.write_all(b"\"children\": [")?;
+    if !child_refs.is_empty() {
+        writer.write_all(b"\n")?;
+    }
+    let mut first = true;
+    for child_ref in child_refs {
+        if !first {
+            writer.write_all(b",\n")?;
+        }
+        first = false;
+        write_gui_instance_node(writer, dom, child_ref, &path, indent + 2, collector)?;
+    }
+    if !first {
+        writer.write_all(b"\n")?;
+        write_indent(writer, indent + 1)?;
+    }
+    writer.write_all(b"]\n")?;
+    write_indent(writer, indent)?;
+    writer.write_all(b"}")?;
+    Ok(())
 }
 
 fn write_compile_state(
     input: &Path,
     input_format: RobloxFileFormat,
     output_folder: &Path,
-    instance_roots: &[InstanceNode],
+    instances_path: &Path,
+    instance_count: usize,
     script_manifest: &[ScriptManifestEntry],
 ) -> Result<()> {
     let state_dir = output_folder.join(COMPILE_STATE_DIR);
@@ -557,16 +864,16 @@ fn write_compile_state(
         )
     })?;
 
-    let baseline_path = PathBuf::from(COMPILE_BASELINE_INSTANCES_FILE);
-    write_json(&state_dir.join(&baseline_path), &instance_roots)?;
     let recorded_input = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
 
     let metadata = CompileMetadata {
-        version: 1,
+        version: 2,
         input: recorded_input,
         input_format,
         original_snapshot: snapshot_path,
-        baseline_instances: baseline_path,
+        baseline_instances: None,
+        instances_fingerprint: Some(file_fingerprint(instances_path)?),
+        instance_count: Some(instance_count),
         scripts: script_manifest
             .iter()
             .map(|entry| CompileScriptEntry {
@@ -614,7 +921,7 @@ fn serializable_properties(
     instance: &rbx_dom_weak::Instance,
     roblox_path: &str,
     collector: &mut ExtractionCollector,
-) -> BTreeMap<String, Value> {
+) -> Result<BTreeMap<String, Value>> {
     let mut properties = BTreeMap::new();
 
     for (name, value) in &instance.properties {
@@ -634,33 +941,28 @@ fn serializable_properties(
                     name,
                     value.ty()
                 );
-                collector.unsupported_properties.push(note.clone());
-                collector.warnings.push(note);
+                collector.record_unsupported_property(note)?;
             }
         }
     }
 
-    properties
+    Ok(properties)
 }
 
-fn variant_to_json_value(value: &Variant) -> Option<Value> {
-    match value {
-        Variant::BinaryString(_) | Variant::SharedString(_) | Variant::MaterialColors(_) => None,
-        Variant::Bool(value) => Some(Value::Bool(*value)),
-        Variant::Float32(value) => Some(Value::from(*value)),
-        Variant::Float64(value) => Some(Value::from(*value)),
-        Variant::Int32(value) => Some(Value::from(*value)),
-        Variant::Int64(value) => Some(Value::from(*value)),
-        Variant::String(value) => Some(Value::String(value.clone())),
-        Variant::ContentId(value) => Some(Value::String(value.as_str().to_owned())),
-        Variant::Content(value) => match value.value() {
-            ContentType::None => Some(Value::Null),
-            ContentType::Uri(uri) => Some(Value::String(uri.clone())),
-            ContentType::Object(referent) => Some(Value::String(format!("{referent:?}"))),
-            _ => None,
-        },
-        _ => serde_json::to_value(value).ok(),
+fn serializable_properties_without_notes(
+    instance: &rbx_dom_weak::Instance,
+) -> BTreeMap<String, Value> {
+    let mut properties = BTreeMap::new();
+    for (name, value) in &instance.properties {
+        let name = name.to_string();
+        if name == "Source" {
+            continue;
+        }
+        if let Some(value) = variant_to_json_value(value) {
+            properties.insert(name, value);
+        }
     }
+    properties
 }
 
 fn collect_content_refs(
@@ -668,18 +970,19 @@ fn collect_content_refs(
     roblox_path: &str,
     class_name: &str,
     collector: &mut ExtractionCollector,
-) {
+) -> Result<()> {
     for (property_name, value) in &instance.properties {
         let property_name = property_name.to_string();
         for reference in content_reference_values(&property_name, value) {
-            collector.content_refs.push(ContentReference {
+            collector.record_content_ref(ContentReference {
                 roblox_path: roblox_path.to_owned(),
                 class_name: class_name.to_owned(),
                 property_name: property_name.clone(),
                 value: reference,
-            });
+            })?;
         }
     }
+    Ok(())
 }
 
 fn content_reference_values(property_name: &str, value: &Variant) -> Vec<String> {
@@ -774,9 +1077,88 @@ fn unique_path(path: &Path, used_paths: &mut HashSet<PathBuf>) -> PathBuf {
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let json =
-        serde_json::to_string_pretty(value).context("failed to serialize extraction JSON")?;
-    fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create JSON output directory {}",
+            parent.display()
+        )
+    })?;
+    let mut writer = BufWriter::new(
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, value)
+        .context("failed to serialize extraction JSON")?;
+    writer
+        .write_all(b"\n")
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_manifest(
+    path: &Path,
+    input: &Path,
+    output_folder: &Path,
+    input_format: RobloxFileFormat,
+    counts: &ExtractionCounts,
+    scripts: &[ScriptManifestEntry],
+    warnings_path: &Path,
+    unsupported_path: &Path,
+) -> Result<()> {
+    let mut writer = BufWriter::new(
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+    );
+    writer.write_all(b"{\n  \"input\": ")?;
+    serde_json::to_writer(&mut writer, input)?;
+    writer.write_all(b",\n  \"output_folder\": ")?;
+    serde_json::to_writer(&mut writer, output_folder)?;
+    writer.write_all(b",\n  \"timestamp\": ")?;
+    serde_json::to_writer(&mut writer, &timestamp_seconds())?;
+    writer.write_all(b",\n  \"tool_version\": ")?;
+    serde_json::to_writer(&mut writer, env!("CARGO_PKG_VERSION"))?;
+    writer.write_all(b",\n  \"mode\": \"extract\",\n  \"input_format\": ")?;
+    serde_json::to_writer(&mut writer, &input_format)?;
+    writer.write_all(b",\n  \"counts\": ")?;
+    serde_json::to_writer(&mut writer, counts)?;
+    writer.write_all(b",\n  \"scripts\": ")?;
+    serde_json::to_writer(&mut writer, scripts)?;
+    writer.write_all(b",\n  \"warnings\": ")?;
+    copy_json_file(&mut writer, warnings_path)?;
+    writer.write_all(b",\n  \"unsupported_properties\": ")?;
+    copy_json_file(&mut writer, unsupported_path)?;
+    writer.write_all(b"\n}\n")?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn copy_json_file(writer: &mut dyn Write, path: &Path) -> Result<()> {
+    let mut reader = BufReader::new(
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
+    );
+    io::copy(&mut reader, writer).with_context(|| format!("failed to copy {}", path.display()))?;
+    Ok(())
+}
+
+fn file_fingerprint(path: &Path) -> Result<FileFingerprint> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let modified = metadata.modified().ok().and_then(|time| {
+        time.duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+    });
+    Ok(FileFingerprint {
+        len: metadata.len(),
+        modified_secs: modified.map(|(secs, _)| secs),
+        modified_nanos: modified.map(|(_, nanos)| nanos),
+    })
 }
 
 fn timestamp_seconds() -> u64 {
@@ -839,8 +1221,8 @@ mod tests {
         let collector = collect_components(&dom).unwrap();
 
         assert_eq!(collector.gui_roots.len(), 1);
-        assert_eq!(collector.unsupported_properties.len(), 1);
-        assert!(collector.unsupported_properties[0].contains("Binary"));
+        assert_eq!(collector.unsupported_properties_count, 1);
+        assert_eq!(collector.warnings_count, 1);
     }
 
     #[test]
@@ -860,7 +1242,7 @@ mod tests {
 
         assert_eq!(collector.total_instances, 2);
         assert_eq!(collector.scripts.len(), 1);
-        assert_eq!(collector.content_refs.len(), 1);
+        assert_eq!(collector.content_refs_count, 1);
     }
 
     #[test]
@@ -924,9 +1306,9 @@ mod tests {
             .join(COMPILE_STATE_DIR)
             .join(COMPILE_METADATA_FILE)
             .exists());
-        assert!(output
+        assert!(!output
             .join(COMPILE_STATE_DIR)
-            .join(COMPILE_BASELINE_INSTANCES_FILE)
+            .join("baseline_instances.json")
             .exists());
         assert!(events
             .iter()

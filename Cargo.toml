@@ -13,8 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+byteorder = "1.5"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
+lz4_flex = "0.11"
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
 rbx_binary = "2.0"
 rbx_dom_weak = "4.1"

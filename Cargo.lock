@@ -1330,8 +1330,10 @@ name = "rbx-obfuscator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "byteorder",
  "clap",
  "crossterm",
+ "lz4_flex",
  "ratatui",
  "rbx_binary",
  "rbx_dom_weak",

@@ -1,6 +1,8 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    fs,
+    collections::BTreeMap,
+    fmt,
+    fs::{self, File},
+    io::{BufReader, Read},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -10,13 +12,14 @@ use rbx_dom_weak::{
     types::{Content, ContentId, ContentType, Ref, Variant},
     ustr, WeakDom,
 };
-use serde::Deserialize;
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::{
     detect_binary_compression, read_roblox_file, same_path, validate_input_format,
-    write_roblox_file_with_binary_compression, CompileMetadata, ProgressEvent,
-    COMPILE_METADATA_FILE, COMPILE_STATE_DIR, SCRIPT_CLASSES,
+    variant_to_json_value, write_roblox_file_with_binary_compression, CompileMetadata,
+    FileFingerprint, ProgressEvent, COMPILE_BASELINE_INSTANCES_FILE, COMPILE_METADATA_FILE,
+    COMPILE_STATE_DIR, SCRIPT_CLASSES,
 };
 
 #[derive(Debug)]
@@ -33,32 +36,6 @@ pub struct CompileSummary {
     pub scripts_updated: usize,
     pub instances_changed: usize,
     pub duration: Duration,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct InstanceNode {
-    id: String,
-    name: String,
-    class_name: String,
-    #[allow(dead_code)]
-    roblox_path: String,
-    properties: BTreeMap<String, Value>,
-    children: Vec<InstanceNode>,
-}
-
-#[derive(Clone, Debug)]
-struct FlatNode {
-    name: String,
-    class_name: String,
-    parent_id: Option<String>,
-    child_ids: Vec<String>,
-    properties: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Debug)]
-struct InstanceIndex {
-    nodes: HashMap<String, FlatNode>,
-    root_ids: Vec<String>,
 }
 
 pub fn run(options: CompileOptions) -> Result<CompileSummary> {
@@ -104,17 +81,44 @@ where
     let state_dir = state_dir(&options.input_folder);
     let snapshot = state_dir.join(&metadata.original_snapshot);
 
+    if let Some(summary) =
+        crate::binary_fast::try_compile_binary_script_patch(&options, &output, &metadata)?
+    {
+        progress(ProgressEvent::StageCompleted {
+            stage_index: 1,
+            stage_total: 3,
+            name: "Load extracted project".to_owned(),
+        });
+        progress(ProgressEvent::StageStarted {
+            stage_index: 2,
+            stage_total: 3,
+            name: "Apply extracted edits".to_owned(),
+        });
+        progress(ProgressEvent::StageCompleted {
+            stage_index: 2,
+            stage_total: 3,
+            name: "Apply extracted edits".to_owned(),
+        });
+        progress(ProgressEvent::StageStarted {
+            stage_index: 3,
+            stage_total: 3,
+            name: "Write compiled file".to_owned(),
+        });
+        progress(ProgressEvent::StageCompleted {
+            stage_index: 3,
+            stage_total: 3,
+            name: "Write compiled file".to_owned(),
+        });
+        progress(ProgressEvent::Finished);
+        return Ok(summary);
+    }
+
     progress(ProgressEvent::CurrentItem {
         label: "Current thing".to_owned(),
         value: "Loading original Roblox file".to_owned(),
     });
     let mut dom = read_roblox_file(&snapshot, metadata.input_format)?;
-    let baseline = read_instance_tree(&state_dir.join(&metadata.baseline_instances))?;
-    let current = read_instance_tree(&options.input_folder.join("instances.json"))?;
-    let ref_map = build_ref_map(&dom, &baseline)?;
-    let baseline_nodes = flatten_nodes(&baseline)?;
-    let current_nodes = flatten_nodes(&current)?;
-    validate_instance_diff(&baseline_nodes, &current_nodes)?;
+    let ref_index = build_ref_index(&dom)?;
     if should_cancel() {
         bail!("operation cancelled");
     }
@@ -134,7 +138,7 @@ where
         value: "Applying instances.json changes".to_owned(),
     });
     let instances_changed =
-        apply_instance_changes(&mut dom, &ref_map, &baseline_nodes, &current_nodes)?;
+        maybe_apply_instance_json_changes(&mut dom, &options.input_folder, &metadata, &ref_index)?;
     if should_cancel() {
         bail!("operation cancelled");
     }
@@ -152,7 +156,7 @@ where
         &mut dom,
         &options.input_folder,
         &metadata,
-        &ref_map,
+        &ref_index,
         scripts_total,
         &mut progress,
     )?;
@@ -213,12 +217,6 @@ pub fn validate_compile_project(input_folder: &Path) -> Result<()> {
             metadata.display()
         );
     }
-    if !input_folder.join("instances.json").is_file() {
-        bail!(
-            "instances.json is missing from extracted project: {}",
-            input_folder.display()
-        );
-    }
     Ok(())
 }
 
@@ -268,7 +266,7 @@ fn state_dir(input_folder: &Path) -> PathBuf {
 fn read_metadata(input_folder: &Path) -> Result<CompileMetadata> {
     let path = state_dir(input_folder).join(COMPILE_METADATA_FILE);
     let metadata: CompileMetadata = read_json(&path)?;
-    if metadata.version != 1 {
+    if !matches!(metadata.version, 1 | 2) {
         bail!(
             "unsupported compile metadata version {} in {}",
             metadata.version,
@@ -282,10 +280,24 @@ fn read_metadata(input_folder: &Path) -> Result<CompileMetadata> {
             state.join(&metadata.original_snapshot).display()
         );
     }
-    if !state.join(&metadata.baseline_instances).is_file() {
+    if metadata.version == 1
+        && !metadata
+            .baseline_instances
+            .as_ref()
+            .is_some_and(|baseline| state.join(baseline).is_file())
+    {
         bail!(
             "baseline instance metadata is missing: {}",
-            state.join(&metadata.baseline_instances).display()
+            metadata
+                .baseline_instances
+                .as_ref()
+                .map(|baseline| state.join(baseline).display().to_string())
+                .unwrap_or_else(|| {
+                    state
+                        .join(COMPILE_BASELINE_INSTANCES_FILE)
+                        .display()
+                        .to_string()
+                })
         );
     }
     Ok(metadata)
@@ -304,300 +316,414 @@ fn default_output_path(metadata: &CompileMetadata) -> Result<PathBuf> {
     Ok(metadata.input.with_file_name(file_name))
 }
 
-fn read_instance_tree(path: &Path) -> Result<Vec<InstanceNode>> {
-    read_json(path)
-}
-
-fn build_ref_map(dom: &WeakDom, baseline_roots: &[InstanceNode]) -> Result<HashMap<String, Ref>> {
+fn build_ref_index(dom: &WeakDom) -> Result<Vec<Ref>> {
     let root = dom
         .get_by_ref(dom.root_ref())
         .ok_or_else(|| anyhow!("preserved Roblox DOM root is missing"))?;
-    let root_children = root.children();
-    if root_children.len() != baseline_roots.len() {
-        bail!(
-            "preserved Roblox file no longer matches extraction baseline: expected {} root instance(s), found {}",
-            baseline_roots.len(),
-            root_children.len()
-        );
-    }
-
-    let mut refs = HashMap::new();
-    for (node, referent) in baseline_roots.iter().zip(root_children.iter().copied()) {
-        map_baseline_refs(dom, node, referent, &mut refs)?;
+    let mut refs = Vec::new();
+    for child_ref in root.children().iter().copied() {
+        push_ref_index(dom, child_ref, &mut refs)?;
     }
     Ok(refs)
 }
 
-fn map_baseline_refs(
-    dom: &WeakDom,
-    node: &InstanceNode,
-    referent: Ref,
-    refs: &mut HashMap<String, Ref>,
-) -> Result<()> {
+fn push_ref_index(dom: &WeakDom, referent: Ref, refs: &mut Vec<Ref>) -> Result<()> {
+    refs.push(referent);
     let instance = dom
         .get_by_ref(referent)
         .ok_or_else(|| anyhow!("preserved Roblox file is missing an expected instance"))?;
-    if instance.name != node.name || instance.class.as_str() != node.class_name {
-        bail!(
-            "preserved Roblox file no longer matches extraction baseline at id {}: expected {} {}, found {} {}",
-            node.id,
-            node.class_name,
-            node.name,
-            instance.class,
-            instance.name
-        );
-    }
-    if refs.insert(node.id.clone(), referent).is_some() {
-        bail!(
-            "baseline instance metadata contains duplicate id {}",
-            node.id
-        );
-    }
-
-    let children = instance.children();
-    if children.len() != node.children.len() {
-        bail!(
-            "preserved Roblox file no longer matches extraction baseline at id {}: expected {} child instance(s), found {}",
-            node.id,
-            node.children.len(),
-            children.len()
-        );
-    }
-    for (child_node, child_ref) in node.children.iter().zip(children.iter().copied()) {
-        map_baseline_refs(dom, child_node, child_ref, refs)?;
+    let children = instance.children().to_vec();
+    for child_ref in children {
+        push_ref_index(dom, child_ref, refs)?;
     }
     Ok(())
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
+    let file = File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_reader(BufReader::new(file))
+        .with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn flatten_nodes(nodes: &[InstanceNode]) -> Result<InstanceIndex> {
-    let mut flattened = HashMap::new();
-    let root_ids = nodes.iter().map(|node| node.id.clone()).collect();
-    for node in nodes {
-        flatten_node(node, None, &mut flattened)?;
+fn maybe_apply_instance_json_changes(
+    dom: &mut WeakDom,
+    input_folder: &Path,
+    metadata: &CompileMetadata,
+    ref_index: &[Ref],
+) -> Result<usize> {
+    let instances_path = input_folder.join("instances.json");
+    if !instances_path.is_file() {
+        return Ok(0);
     }
-    Ok(InstanceIndex {
-        nodes: flattened,
-        root_ids,
+
+    if metadata.version == 2 {
+        if let Some(expected) = &metadata.instances_fingerprint {
+            if file_fingerprint(&instances_path).ok().as_ref() == Some(expected) {
+                return Ok(0);
+            }
+        }
+    } else if let Some(baseline) = &metadata.baseline_instances {
+        let baseline_path = state_dir(input_folder).join(baseline);
+        if baseline_path.is_file() && files_equal(&instances_path, &baseline_path)? {
+            return Ok(0);
+        }
+    }
+
+    apply_instance_json_changes(dom, &instances_path, ref_index)
+}
+
+fn file_fingerprint(path: &Path) -> Result<FileFingerprint> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let modified = metadata.modified().ok().and_then(|time| {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+    });
+    Ok(FileFingerprint {
+        len: metadata.len(),
+        modified_secs: modified.map(|(secs, _)| secs),
+        modified_nanos: modified.map(|(_, nanos)| nanos),
     })
 }
 
-fn flatten_node(
-    node: &InstanceNode,
-    parent_id: Option<&str>,
-    flattened: &mut HashMap<String, FlatNode>,
-) -> Result<()> {
-    if node.id.trim().is_empty() {
-        bail!("instances.json contains an instance with an empty id");
-    }
-    if flattened.contains_key(&node.id) {
-        bail!("instances.json contains duplicate instance id {}", node.id);
+fn files_equal(left_path: &Path, right_path: &Path) -> Result<bool> {
+    let left_metadata = fs::metadata(left_path)
+        .with_context(|| format!("failed to read metadata for {}", left_path.display()))?;
+    let right_metadata = fs::metadata(right_path)
+        .with_context(|| format!("failed to read metadata for {}", right_path.display()))?;
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
     }
 
-    let child_ids = node
-        .children
-        .iter()
-        .map(|child| child.id.clone())
-        .collect::<Vec<_>>();
-    flattened.insert(
-        node.id.clone(),
-        FlatNode {
-            name: node.name.clone(),
-            class_name: node.class_name.clone(),
-            parent_id: parent_id.map(str::to_owned),
-            child_ids,
-            properties: node.properties.clone(),
-        },
+    let mut left = BufReader::new(
+        File::open(left_path).with_context(|| format!("failed to open {}", left_path.display()))?,
     );
-
-    for child in &node.children {
-        flatten_node(child, Some(&node.id), flattened)?;
+    let mut right = BufReader::new(
+        File::open(right_path)
+            .with_context(|| format!("failed to open {}", right_path.display()))?,
+    );
+    let mut left_buffer = vec![0u8; 1024 * 1024];
+    let mut right_buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let left_read = left
+            .read(&mut left_buffer)
+            .with_context(|| format!("failed to read {}", left_path.display()))?;
+        let right_read = right
+            .read(&mut right_buffer)
+            .with_context(|| format!("failed to read {}", right_path.display()))?;
+        if left_read != right_read {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+        if left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
     }
-    Ok(())
 }
 
-fn validate_instance_diff(baseline: &InstanceIndex, current: &InstanceIndex) -> Result<()> {
-    let baseline_ids = baseline.nodes.keys().collect::<BTreeSet<_>>();
-    let current_ids = current.nodes.keys().collect::<BTreeSet<_>>();
-    if baseline_ids != current_ids {
-        let added = current_ids
-            .difference(&baseline_ids)
-            .map(|id| id.as_str())
-            .collect::<Vec<_>>();
-        let deleted = baseline_ids
-            .difference(&current_ids)
-            .map(|id| id.as_str())
-            .collect::<Vec<_>>();
+fn apply_instance_json_changes(
+    dom: &mut WeakDom,
+    instances_path: &Path,
+    ref_index: &[Ref],
+) -> Result<usize> {
+    let file = File::open(instances_path)
+        .with_context(|| format!("failed to read {}", instances_path.display()))?;
+    let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(file));
+    let mut applier = InstanceJsonApplier::new(dom, ref_index);
+    let root_children = RootInstancesSeed {
+        applier: &mut applier,
+    }
+    .deserialize(&mut deserializer)
+    .with_context(|| format!("failed to parse {}", instances_path.display()))?;
+    deserializer
+        .end()
+        .with_context(|| format!("failed to parse {}", instances_path.display()))?;
+    let root_ref = applier.dom.root_ref();
+    applier.reorder_children(root_ref, &root_children)?;
+    applier.finish()?;
+    Ok(applier.changed)
+}
+
+struct InstanceJsonApplier<'a> {
+    dom: &'a mut WeakDom,
+    ref_index: &'a [Ref],
+    seen: Vec<bool>,
+    changed: usize,
+}
+
+impl<'a> InstanceJsonApplier<'a> {
+    fn new(dom: &'a mut WeakDom, ref_index: &'a [Ref]) -> Self {
+        Self {
+            dom,
+            ref_index,
+            seen: vec![false; ref_index.len()],
+            changed: 0,
+        }
+    }
+
+    fn apply_node(
+        &mut self,
+        id: String,
+        name: String,
+        class_name: String,
+        properties: BTreeMap<String, Value>,
+        children: Vec<Ref>,
+    ) -> Result<Ref> {
+        let index = parse_instance_id(&id)?;
+        let referent = *self.ref_index.get(index).ok_or_else(|| {
+            anyhow!("instances.json cannot add or delete instances; unknown instance id {id}")
+        })?;
+        if std::mem::replace(&mut self.seen[index], true) {
+            bail!("instances.json contains duplicate instance id {id}");
+        }
+
+        let updates = {
+            let instance = self
+                .dom
+                .get_by_ref(referent)
+                .ok_or_else(|| anyhow!("original Roblox file is missing instance id {id}"))?;
+            if instance.class.as_str() != class_name {
+                bail!(
+                    "instances.json cannot change class for id {id}: {} -> {}",
+                    instance.class,
+                    class_name
+                );
+            }
+            validate_and_collect_property_updates(instance, &id, &properties)?
+        };
+
+        let instance = self
+            .dom
+            .get_by_ref_mut(referent)
+            .ok_or_else(|| anyhow!("original Roblox file is missing instance id {id}"))?;
+        if instance.name != name {
+            instance.name = name;
+            self.changed += 1;
+        }
+        for (property_name, value) in updates {
+            instance.properties.insert(ustr(&property_name), value);
+            self.changed += 1;
+        }
+
+        self.reorder_children(referent, &children)?;
+        Ok(referent)
+    }
+
+    fn reorder_children(&mut self, parent: Ref, desired_children: &[Ref]) -> Result<()> {
+        let current_children = self
+            .dom
+            .get_by_ref(parent)
+            .ok_or_else(|| anyhow!("original Roblox file is missing an expected parent"))?
+            .children()
+            .to_vec();
+        if current_children == desired_children {
+            return Ok(());
+        }
+        for child in desired_children {
+            self.dom.transfer_within(*child, parent);
+        }
+        self.changed += 1;
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        if let Some((index, _)) = self.seen.iter().enumerate().find(|(_, seen)| !**seen) {
+            bail!(
+                "instances.json cannot add or delete instances; missing instance id {}",
+                format_instance_id(index)
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_and_collect_property_updates(
+    instance: &rbx_dom_weak::Instance,
+    id: &str,
+    properties: &BTreeMap<String, Value>,
+) -> Result<Vec<(String, Variant)>> {
+    let mut expected_count = 0usize;
+    for (name, original) in &instance.properties {
+        if name.as_str() == "Source" {
+            continue;
+        }
+        if variant_to_json_value(original).is_some() {
+            expected_count += 1;
+            if !properties.contains_key(name.as_str()) {
+                bail!(
+                    "instances.json cannot add or delete properties for id {id}; missing property {}",
+                    name
+                );
+            }
+        }
+    }
+    if properties.len() != expected_count {
         bail!(
-            "instances.json cannot add or delete instances in this version; added: [{}], deleted: [{}]",
-            added.join(", "),
-            deleted.join(", ")
+            "instances.json cannot add or delete properties for id {id}; only existing exported properties can be edited"
         );
     }
 
-    for (id, baseline_node) in &baseline.nodes {
-        let current_node = current
-            .nodes
-            .get(id)
-            .ok_or_else(|| anyhow!("missing instance id {id}"))?;
-        if baseline_node.class_name != current_node.class_name {
-            bail!(
-                "instances.json cannot change class for id {id}: {} -> {}",
-                baseline_node.class_name,
-                current_node.class_name
-            );
+    let mut updates = Vec::new();
+    for (property_name, current_value) in properties {
+        if property_name == "Source" {
+            bail!("script Source edits must be made in scripts/, not instances.json");
         }
-
-        let baseline_properties = baseline_node.properties.keys().collect::<BTreeSet<_>>();
-        let current_properties = current_node.properties.keys().collect::<BTreeSet<_>>();
-        if baseline_properties != current_properties {
-            bail!(
-                "instances.json cannot add or delete properties for id {id}; only existing exported properties can be edited"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_instance_changes(
-    dom: &mut WeakDom,
-    ref_map: &HashMap<String, Ref>,
-    baseline: &InstanceIndex,
-    current: &InstanceIndex,
-) -> Result<usize> {
-    let mut changed = 0usize;
-
-    for (id, current_node) in &current.nodes {
-        let baseline_node = baseline
-            .nodes
-            .get(id)
-            .ok_or_else(|| anyhow!("missing baseline instance id {id}"))?;
-        let referent = *ref_map
-            .get(id)
-            .ok_or_else(|| anyhow!("missing preserved Roblox referent for instance id {id}"))?;
-        let instance = dom
-            .get_by_ref_mut(referent)
-            .ok_or_else(|| anyhow!("original Roblox file is missing instance id {id}"))?;
-
-        if instance.class.as_str() != baseline_node.class_name {
-            bail!(
-                "original Roblox file no longer matches baseline for id {id}: expected class {}, found {}",
-                baseline_node.class_name,
-                instance.class
-            );
-        }
-
-        if current_node.name != baseline_node.name {
-            instance.name = current_node.name.clone();
-            changed += 1;
-        }
-
-        for (property_name, current_value) in &current_node.properties {
-            let baseline_value = baseline_node
-                .properties
-                .get(property_name)
-                .ok_or_else(|| anyhow!("missing baseline property {property_name} for id {id}"))?;
-            if current_value == baseline_value {
-                continue;
-            }
-            if property_name == "Source" {
-                bail!("script Source edits must be made in scripts/, not instances.json");
-            }
-
-            let property_key = ustr(property_name);
-            let original = instance.properties.get(&property_key).ok_or_else(|| {
-                anyhow!("original Roblox file is missing property {property_name} for id {id}")
-            })?;
-            let updated = json_to_variant(original, current_value, id, property_name)?;
-            instance.properties.insert(property_key, updated);
-            changed += 1;
-        }
-    }
-
-    for (id, current_node) in &current.nodes {
-        let baseline_node = baseline
-            .nodes
-            .get(id)
-            .ok_or_else(|| anyhow!("missing baseline instance id {id}"))?;
-        if current_node.parent_id == baseline_node.parent_id {
-            continue;
-        }
-
-        let referent = *ref_map
-            .get(id)
-            .ok_or_else(|| anyhow!("missing preserved Roblox referent for instance id {id}"))?;
-        let parent = current_node
-            .parent_id
-            .as_deref()
-            .map(|parent_id| {
-                ref_map.get(parent_id).copied().ok_or_else(|| {
-                    anyhow!("missing preserved Roblox referent for parent id {parent_id}")
-                })
-            })
-            .transpose()?
-            .unwrap_or_else(|| dom.root_ref());
-        dom.transfer_within(referent, parent);
-        changed += 1;
-    }
-
-    reorder_children(dom, ref_map, current)?;
-    Ok(changed + order_change_count(baseline, current))
-}
-
-fn reorder_children(
-    dom: &mut WeakDom,
-    ref_map: &HashMap<String, Ref>,
-    current: &InstanceIndex,
-) -> Result<()> {
-    for child_id in &current.root_ids {
-        let child_ref = *ref_map.get(child_id).ok_or_else(|| {
-            anyhow!("missing preserved Roblox referent for instance id {child_id}")
+        let property_key = ustr(property_name);
+        let original = instance.properties.get(&property_key).ok_or_else(|| {
+            anyhow!("original Roblox file is missing property {property_name} for id {id}")
         })?;
-        dom.transfer_within(child_ref, dom.root_ref());
-    }
-
-    for (parent_id, parent_node) in &current.nodes {
-        let parent = *ref_map.get(parent_id).ok_or_else(|| {
-            anyhow!("missing preserved Roblox referent for parent id {parent_id}")
+        let baseline_value = variant_to_json_value(original).ok_or_else(|| {
+            anyhow!("property {property_name} for id {id} is not editable from instances.json")
         })?;
-        for child_id in &parent_node.child_ids {
-            let child_ref = *ref_map.get(child_id).ok_or_else(|| {
-                anyhow!("missing preserved Roblox referent for instance id {child_id}")
-            })?;
-            dom.transfer_within(child_ref, parent);
+        if current_value != &baseline_value {
+            updates.push((
+                property_name.clone(),
+                json_to_variant(original, current_value, id, property_name)?,
+            ));
         }
     }
-    Ok(())
+    Ok(updates)
 }
 
-fn order_change_count(baseline: &InstanceIndex, current: &InstanceIndex) -> usize {
-    let mut count = 0usize;
-    if baseline.root_ids != current.root_ids {
-        count += 1;
+fn parse_instance_id(id: &str) -> Result<usize> {
+    let number = id
+        .strip_prefix("inst_")
+        .ok_or_else(|| {
+            anyhow!("instances.json cannot add or delete instances; invalid instance id {id}")
+        })?
+        .parse::<usize>()
+        .with_context(|| {
+            format!("instances.json cannot add or delete instances; invalid instance id {id}")
+        })?;
+    if number == 0 {
+        bail!("instances.json cannot add or delete instances; invalid instance id {id}");
     }
-    for (id, current_node) in &current.nodes {
-        if baseline
-            .nodes
-            .get(id)
-            .map(|node| node.child_ids.as_slice() != current_node.child_ids.as_slice())
-            .unwrap_or(false)
-        {
-            count += 1;
+    Ok(number - 1)
+}
+
+fn format_instance_id(index: usize) -> String {
+    format!("inst_{:06}", index + 1)
+}
+
+struct RootInstancesSeed<'a, 'dom> {
+    applier: &'a mut InstanceJsonApplier<'dom>,
+}
+
+impl<'de, 'a, 'dom> DeserializeSeed<'de> for RootInstancesSeed<'a, 'dom> {
+    type Value = Vec<Ref>;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ChildrenVisitor {
+            applier: self.applier,
+        })
+    }
+}
+
+struct ChildrenVisitor<'a, 'dom> {
+    applier: &'a mut InstanceJsonApplier<'dom>,
+}
+
+impl<'de, 'a, 'dom> Visitor<'de> for ChildrenVisitor<'a, 'dom> {
+    type Value = Vec<Ref>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of instance nodes")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut children = Vec::new();
+        while let Some(referent) = seq.next_element_seed(InstanceNodeSeed {
+            applier: &mut *self.applier,
+        })? {
+            children.push(referent);
         }
+        Ok(children)
     }
-    count
+}
+
+struct InstanceNodeSeed<'a, 'dom> {
+    applier: &'a mut InstanceJsonApplier<'dom>,
+}
+
+impl<'de, 'a, 'dom> DeserializeSeed<'de> for InstanceNodeSeed<'a, 'dom> {
+    type Value = Ref;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(InstanceNodeVisitor {
+            applier: self.applier,
+        })
+    }
+}
+
+struct InstanceNodeVisitor<'a, 'dom> {
+    applier: &'a mut InstanceJsonApplier<'dom>,
+}
+
+impl<'de, 'a, 'dom> Visitor<'de> for InstanceNodeVisitor<'a, 'dom> {
+    type Value = Ref;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an instance node object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut id = None;
+        let mut name = None;
+        let mut class_name = None;
+        let mut properties = None;
+        let mut children = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "id" => id = Some(map.next_value()?),
+                "name" => name = Some(map.next_value()?),
+                "class_name" => class_name = Some(map.next_value()?),
+                "roblox_path" => {
+                    let _: Value = map.next_value()?;
+                }
+                "properties" => properties = Some(map.next_value()?),
+                "children" => {
+                    children = Some(map.next_value_seed(RootInstancesSeed {
+                        applier: &mut *self.applier,
+                    })?);
+                }
+                _ => {
+                    let _: Value = map.next_value()?;
+                }
+            }
+        }
+
+        let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
+        let name = name.ok_or_else(|| de::Error::missing_field("name"))?;
+        let class_name = class_name.ok_or_else(|| de::Error::missing_field("class_name"))?;
+        let properties = properties.ok_or_else(|| de::Error::missing_field("properties"))?;
+        let children = children.ok_or_else(|| de::Error::missing_field("children"))?;
+        self.applier
+            .apply_node(id, name, class_name, properties, children)
+            .map_err(de::Error::custom)
+    }
 }
 
 fn apply_script_changes<F>(
     dom: &mut WeakDom,
     input_folder: &Path,
     metadata: &CompileMetadata,
-    ref_map: &HashMap<String, Ref>,
+    ref_index: &[Ref],
     scripts_total: usize,
     progress: &mut F,
 ) -> Result<usize>
@@ -612,12 +738,14 @@ where
         let path = input_folder.join(source_file);
         let source = fs::read_to_string(&path)
             .with_context(|| format!("failed to read script source {}", path.display()))?;
-        let referent = *ref_map.get(&script.id).ok_or_else(|| {
-            anyhow!(
-                "missing preserved Roblox referent for script id {}",
-                script.id
-            )
-        })?;
+        let referent = *ref_index
+            .get(parse_instance_id(&script.id)?)
+            .ok_or_else(|| {
+                anyhow!(
+                    "missing preserved Roblox referent for script id {}",
+                    script.id
+                )
+            })?;
         let instance = dom
             .get_by_ref_mut(referent)
             .ok_or_else(|| anyhow!("original Roblox file is missing script id {}", script.id))?;

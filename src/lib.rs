@@ -13,12 +13,13 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use rbx_binary::CompressionType;
 use rbx_dom_weak::{
-    types::{Ref, Variant},
+    types::{ContentType, Ref, Variant},
     ustr, WeakDom,
 };
 use serde::{Deserialize, Serialize};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
+pub(crate) mod binary_fast;
 pub mod compile;
 pub mod extract;
 
@@ -141,8 +142,20 @@ pub(crate) struct CompileMetadata {
     pub input: PathBuf,
     pub input_format: RobloxFileFormat,
     pub original_snapshot: PathBuf,
-    pub baseline_instances: PathBuf,
+    #[serde(default)]
+    pub baseline_instances: Option<PathBuf>,
+    #[serde(default)]
+    pub instances_fingerprint: Option<FileFingerprint>,
+    #[serde(default)]
+    pub instance_count: Option<usize>,
     pub scripts: Vec<CompileScriptEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FileFingerprint {
+    pub len: u64,
+    pub modified_secs: Option<u64>,
+    pub modified_nanos: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,7 +281,7 @@ struct ScriptCandidate {
 }
 
 #[derive(Debug, Serialize)]
-struct Manifest {
+pub(crate) struct Manifest {
     input: PathBuf,
     input_format: RobloxFileFormat,
     output: PathBuf,
@@ -281,7 +294,7 @@ struct Manifest {
 }
 
 #[derive(Debug, Serialize)]
-struct ManifestEntry {
+pub(crate) struct ManifestEntry {
     path: String,
     class_name: String,
     action: ManifestAction,
@@ -295,7 +308,7 @@ struct ManifestEntry {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum ManifestAction {
+pub(crate) enum ManifestAction {
     Processed,
     Skipped,
     Failed,
@@ -310,13 +323,13 @@ struct FailedScript {
 }
 
 #[derive(Debug)]
-struct PrometheusFailure {
-    error: anyhow::Error,
-    luau_compatibility_applied: bool,
+pub(crate) struct PrometheusFailure {
+    pub(crate) error: anyhow::Error,
+    pub(crate) luau_compatibility_applied: bool,
 }
 
 #[derive(Debug)]
-enum ScriptTransformOutcome {
+pub(crate) enum ScriptTransformOutcome {
     Transformed {
         source: String,
         luau_compatibility_applied: bool,
@@ -378,6 +391,20 @@ where
     validate_options(&options, &output)?;
     let prometheus_path = resolve_or_install_prometheus(options.dry_run, &mut progress)?;
     let prometheus_preset = prometheus_preset_for_level(options.obfuscation_level);
+    if !input_format.is_xml()
+        && output_format == input_format
+        && crate::binary_fast::binary_instance_count(&options.input)? >= 200_000
+    {
+        return crate::binary_fast::obfuscate_binary_large(
+            &options,
+            output,
+            input_format,
+            prometheus_path,
+            &mut should_cancel,
+            &mut script_action,
+            &mut progress,
+        );
+    }
 
     progress(ProgressEvent::StageStarted {
         stage_index: 1,
@@ -991,7 +1018,7 @@ where
     write_prometheus_update_timestamp(state_file, runtime.now())
 }
 
-fn create_prometheus_temp_dir() -> Result<tempfile::TempDir> {
+pub(crate) fn create_prometheus_temp_dir() -> Result<tempfile::TempDir> {
     TempFileBuilder::new()
         .prefix("rbx-obfuscator-")
         .tempdir()
@@ -1130,7 +1157,7 @@ fn is_script_class(class_name: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_prometheus_with_type_fallback<S, F>(
+pub(crate) fn run_prometheus_with_type_fallback<S, F>(
     prometheus_path: &Path,
     input_source: &str,
     level: ObfuscationLevel,
@@ -1672,7 +1699,7 @@ fn compact_process_output(output: &str) -> String {
     compact
 }
 
-fn first_error_line(error: &str) -> &str {
+pub(crate) fn first_error_line(error: &str) -> &str {
     error
         .lines()
         .find(|line| !line.trim().is_empty())
@@ -2589,7 +2616,7 @@ fn luau_helper_insert_index(source: &str) -> usize {
     index
 }
 
-fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
+pub(crate) fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -2813,6 +2840,28 @@ pub(crate) fn detect_binary_compression(
     }
 }
 
+pub(crate) fn variant_to_json_value(value: &Variant) -> Option<serde_json::Value> {
+    match value {
+        Variant::BinaryString(_) | Variant::SharedString(_) | Variant::MaterialColors(_) => None,
+        Variant::Bool(value) => Some(serde_json::Value::Bool(*value)),
+        Variant::Float32(value) => Some(serde_json::Value::from(*value)),
+        Variant::Float64(value) => Some(serde_json::Value::from(*value)),
+        Variant::Int32(value) => Some(serde_json::Value::from(*value)),
+        Variant::Int64(value) => Some(serde_json::Value::from(*value)),
+        Variant::String(value) => Some(serde_json::Value::String(value.clone())),
+        Variant::ContentId(value) => Some(serde_json::Value::String(value.as_str().to_owned())),
+        Variant::Content(value) => match value.value() {
+            ContentType::None => Some(serde_json::Value::Null),
+            ContentType::Uri(uri) => Some(serde_json::Value::String(uri.clone())),
+            ContentType::Object(referent) => {
+                Some(serde_json::Value::String(format!("{referent:?}")))
+            }
+            _ => None,
+        },
+        _ => serde_json::to_value(value).ok(),
+    }
+}
+
 pub(crate) fn same_path(input: &Path, output: &Path) -> Result<bool> {
     let input = input
         .canonicalize()
@@ -2861,7 +2910,7 @@ fn escape_path_segment(segment: &str) -> String {
     segment.replace('\\', "\\\\").replace('.', "\\.")
 }
 
-fn backup_path_for(backup_dir: &Path, instance_path: &str) -> PathBuf {
+pub(crate) fn backup_path_for(backup_dir: &Path, instance_path: &str) -> PathBuf {
     let hash = stable_hash(instance_path);
     let sanitized = sanitize_filename(instance_path);
     backup_dir.join(format!("{sanitized}-{hash:016x}.luau"))
