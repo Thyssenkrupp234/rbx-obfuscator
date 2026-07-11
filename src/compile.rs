@@ -178,8 +178,17 @@ where
         label: "Current thing".to_owned(),
         value: output.display().to_string(),
     });
-    let binary_compression = detect_binary_compression(&snapshot, metadata.input_format)?;
-    write_roblox_file_with_binary_compression(&output, &dom, output_format, binary_compression)?;
+    if output_format == metadata.input_format && instances_changed == 0 && scripts_updated == 0 {
+        copy_snapshot(&snapshot, &output)?;
+    } else {
+        let binary_compression = detect_binary_compression(&snapshot, metadata.input_format)?;
+        write_roblox_file_with_binary_compression(
+            &output,
+            &dom,
+            output_format,
+            binary_compression,
+        )?;
+    }
     progress(ProgressEvent::StageCompleted {
         stage_index: 3,
         stage_total: 3,
@@ -422,6 +431,23 @@ fn files_equal(left_path: &Path, right_path: &Path) -> Result<bool> {
             return Ok(false);
         }
     }
+}
+
+fn copy_snapshot(snapshot: &Path, output: &Path) -> Result<()> {
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    fs::copy(snapshot, output).with_context(|| {
+        format!(
+            "failed to copy preserved original {} to {}",
+            snapshot.display(),
+            output.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn apply_instance_json_changes(
@@ -731,6 +757,7 @@ where
     F: FnMut(ProgressEvent),
 {
     let mut updated = 0usize;
+    let mut processed = 0usize;
     for script in &metadata.scripts {
         let Some(source_file) = &script.source_file else {
             continue;
@@ -756,12 +783,19 @@ where
                 instance.class
             );
         }
-        instance
-            .properties
-            .insert(ustr("Source"), Variant::String(source));
-        updated += 1;
+        let changed = !matches!(
+            instance.properties.get(&ustr("Source")),
+            Some(Variant::String(original)) if original == &source
+        );
+        if changed {
+            instance
+                .properties
+                .insert(ustr("Source"), Variant::String(source));
+            updated += 1;
+        }
+        processed += 1;
         progress(ProgressEvent::ScriptProgress {
-            completed: updated,
+            completed: processed,
             total: scripts_total,
             current_path: Some(script.roblox_path.clone()),
         });
@@ -953,6 +987,43 @@ mod tests {
     }
 
     #[test]
+    fn compile_copies_untouched_xml_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("plugin.rbxmx");
+        let extracted = dir.path().join("plugin");
+        let output = dir.path().join("plugin-compiled.rbxmx");
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel")
+                .with_child(InstanceBuilder::new("Folder").with_name("Plugin")),
+        );
+        crate::write_roblox_file(&input, &dom, RobloxFileFormat::Rbxmx).unwrap();
+        let original = fs::read(&input).unwrap();
+        let original = String::from_utf8(original)
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into_bytes();
+        fs::write(&input, &original).unwrap();
+
+        crate::extract::run(crate::extract::ExtractOptions {
+            input,
+            output_folder: extracted.clone(),
+            verbose: false,
+        })
+        .unwrap();
+
+        let summary = run(CompileOptions {
+            input_folder: extracted,
+            output: Some(output.clone()),
+            verbose: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.scripts_updated, 0);
+        assert_eq!(summary.instances_changed, 0);
+        assert_eq!(fs::read(output).unwrap(), original);
+    }
+
+    #[test]
     fn compile_rejects_added_instances() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("game.rbxl");
@@ -1038,6 +1109,45 @@ mod tests {
             Some(RobloxBinaryCompression::Zstd)
         );
         crate::read_roblox_file(&output, RobloxFileFormat::Rbxl).unwrap();
+    }
+
+    #[test]
+    fn compile_copies_untouched_binary_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("model.rbxl");
+        let extracted = dir.path().join("model");
+        let output = dir.path().join("model-compiled.rbxl");
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("Script")
+                    .with_name("Main")
+                    .with_property("Source", "print('hi')"),
+            ),
+        );
+        crate::write_roblox_file_with_binary_compression(
+            &input,
+            &dom,
+            RobloxFileFormat::Rbxl,
+            Some(RobloxBinaryCompression::Zstd),
+        )
+        .unwrap();
+        let original = crate::recompress_zstd_chunks(&fs::read(&input).unwrap(), 1).unwrap();
+        fs::write(&input, &original).unwrap();
+
+        crate::extract::run(crate::extract::ExtractOptions {
+            input,
+            output_folder: extracted.clone(),
+            verbose: false,
+        })
+        .unwrap();
+        run(CompileOptions {
+            input_folder: extracted,
+            output: Some(output.clone()),
+            verbose: false,
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(output).unwrap(), original);
     }
 
     fn rename_first_class(value: &mut Value, class_name: &str, new_name: &str) -> bool {

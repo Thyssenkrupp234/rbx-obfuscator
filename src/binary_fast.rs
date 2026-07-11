@@ -1167,15 +1167,17 @@ fn rewrite_source_chunk(
     output.write_u32::<LittleEndian>(type_id)?;
     write_string(&mut output, &prop_name)?;
     output.write_u8(TYPE_STRING)?;
+    let mut changed = false;
     for referent in &type_info.referents {
         let original = read_binary_string(&mut reader)?;
         if let Some(source) = sources_by_ref.get(referent) {
+            changed |= source.as_bytes() != original.as_slice();
             write_binary_string(&mut output, source.as_bytes())?;
         } else {
             write_binary_string(&mut output, &original)?;
         }
     }
-    Ok(Some(output))
+    Ok(changed.then_some(output))
 }
 
 fn write_chunk(
